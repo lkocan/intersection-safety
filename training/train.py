@@ -3,7 +3,8 @@ sys.path.append('.')
 
 import os
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data    import DataLoader
+from torch.cuda.amp      import GradScaler, autocast   # ← FP16
 
 from models.pointpillars import PointPillars, PointPillarsConfig
 from training.loss       import PointPillarsLoss
@@ -11,12 +12,11 @@ from utils.preprocess    import DAIRDataset
 
 
 def collate_fn(batch):
-    """Spája vzorky do batchu — piliere môžu mať rôzny počet."""
     return {
         'pillars':    torch.stack([b['pillars']    for b in batch]),
         'coords':     torch.stack([b['coords']     for b in batch]),
         'num_points': torch.stack([b['num_points'] for b in batch]),
-        'gt_boxes':   [b['gt_boxes'] for b in batch],   # rôzna veľkosť → list
+        'gt_boxes':   [b['gt_boxes'] for b in batch],
         'frame_id':   [b['frame_id'] for b in batch],
     }
 
@@ -24,28 +24,29 @@ def collate_fn(batch):
 def train(cfg, device, save_dir='/content/checkpoints'):
     os.makedirs(save_dir, exist_ok=True)
 
-    # ── Dáta ─────────────────────────────────────────────────────
     train_ds = DAIRDataset(split='train')
     val_ds   = DAIRDataset(split='val')
 
     train_loader = DataLoader(
         train_ds,
-        batch_size  = cfg.batch_size,
-        shuffle     = True,
-        num_workers = 2,
-        collate_fn  = collate_fn,
-        pin_memory  = True,
+        batch_size       = cfg.batch_size,
+        shuffle          = True,
+        num_workers      = 4,              # ← zvýšené
+        collate_fn       = collate_fn,
+        pin_memory       = True,
+        persistent_workers = True,         # ← workers ostanú nažive
+        prefetch_factor  = 2,              # ← načítaj dopredu
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size  = cfg.batch_size,
-        shuffle     = False,
-        num_workers = 2,
-        collate_fn  = collate_fn,
-        pin_memory  = True,
+        batch_size       = cfg.batch_size,
+        shuffle          = False,
+        num_workers      = 4,
+        collate_fn       = collate_fn,
+        pin_memory       = True,
+        persistent_workers = True,
     )
 
-    # ── Model ─────────────────────────────────────────────────────
     model     = PointPillars(cfg).to(device)
     criterion = PointPillarsLoss().to(device)
     optimizer = torch.optim.AdamW(
@@ -55,14 +56,14 @@ def train(cfg, device, save_dir='/content/checkpoints'):
     )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr      = cfg.learning_rate,
+        max_lr          = cfg.learning_rate,
         steps_per_epoch = len(train_loader),
-        epochs      = cfg.num_epochs,
+        epochs          = cfg.num_epochs,
     )
+    scaler = GradScaler()                  # ← FP16 scaler
 
     print(f"Model parametrov: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Tréning: {len(train_ds)} vzoriek | Val: {len(val_ds)} vzoriek")
-    print(f"Device: {device}\n")
+    print(f"Tréning: {len(train_ds)} | Val: {len(val_ds)} | Device: {device}\n")
 
     best_val_loss = float('inf')
 
@@ -72,19 +73,23 @@ def train(cfg, device, save_dir='/content/checkpoints'):
         train_losses = []
 
         for i, batch in enumerate(train_loader):
-            pillars    = batch['pillars'].to(device)     # (B, P, 32, 9)
-            coords     = batch['coords'].to(device)      # (B, P, 2)
-            num_points = batch['num_points'].to(device)  # (B, P)
+            pillars    = batch['pillars'].to(device,    non_blocking=True)
+            coords     = batch['coords'].to(device,     non_blocking=True)
+            num_points = batch['num_points'].to(device, non_blocking=True)
             gt_boxes   = batch['gt_boxes']
             B          = pillars.shape[0]
 
             optimizer.zero_grad()
-            preds  = model(pillars, coords, num_points, batch_size=B)
-            losses = criterion(preds, gt_boxes, batch_size=B)
 
-            losses['total'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            optimizer.step()
+            with autocast():               # ← FP16 forward pass
+                preds  = model(pillars, coords, num_points, batch_size=B)
+                losses = criterion(preds, gt_boxes, batch_size=B)
+
+            scaler.scale(losses['total']).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             train_losses.append(losses['total'].item())
@@ -94,8 +99,7 @@ def train(cfg, device, save_dir='/content/checkpoints'):
                       f"[{i}/{len(train_loader)}]  "
                       f"loss={losses['total'].item():.4f}  "
                       f"cls={losses['cls'].item():.4f}  "
-                      f"reg={losses['reg'].item():.4f}  "
-                      f"dir={losses['dir'].item():.4f}")
+                      f"reg={losses['reg'].item():.4f}")
 
         avg_train = sum(train_losses) / len(train_losses)
 
@@ -105,23 +109,20 @@ def train(cfg, device, save_dir='/content/checkpoints'):
 
         with torch.no_grad():
             for batch in val_loader:
-                pillars    = batch['pillars'].to(device)
-                coords     = batch['coords'].to(device)
-                num_points = batch['num_points'].to(device)
-                gt_boxes   = batch['gt_boxes']
+                pillars    = batch['pillars'].to(device,    non_blocking=True)
+                coords     = batch['coords'].to(device,     non_blocking=True)
+                num_points = batch['num_points'].to(device, non_blocking=True)
                 B          = pillars.shape[0]
 
-                preds  = model(pillars, coords, num_points, batch_size=B)
-                losses = criterion(preds, gt_boxes, batch_size=B)
+                with autocast():
+                    preds  = model(pillars, coords, num_points, batch_size=B)
+                    losses = criterion(preds, batch['gt_boxes'], batch_size=B)
+
                 val_losses.append(losses['total'].item())
 
         avg_val = sum(val_losses) / len(val_losses)
+        print(f"\n→ Epoch {epoch+1} | train={avg_train:.4f} | val={avg_val:.4f}\n")
 
-        print(f"\n→ Epoch {epoch+1} | "
-              f"train_loss={avg_train:.4f} | "
-              f"val_loss={avg_val:.4f}\n")
-
-        # ── Ulož checkpoint ───────────────────────────────────────
         checkpoint = {
             'epoch':      epoch + 1,
             'state_dict': model.state_dict(),
@@ -133,7 +134,7 @@ def train(cfg, device, save_dir='/content/checkpoints'):
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             torch.save(checkpoint, f'{save_dir}/best.pth')
-            print(f"✓ Nový najlepší model uložený (val_loss={avg_val:.4f})")
+            print(f"✓ Najlepší model uložený (val_loss={avg_val:.4f})")
 
 
 if __name__ == '__main__':
