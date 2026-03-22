@@ -38,12 +38,19 @@ class PillarFeatureNet(nn.Module):
 
     def forward(self, pillars, num_points):
         # pillars: (B, P, N, 9)
-        x = self.linear(pillars)                        # (B, P, N, 64)
-        B, P, N, C = x.shape
-        x = x.permute(0, 3, 1, 2)                      # (B, 64, P, N)
-        x = self.bn(x.reshape(B * C, P * N)).reshape(B, C, P, N)
+        B, P, N, _ = pillars.shape
+
+        x = self.linear(pillars)             # (B, P, N, 64)
+
+        # BatchNorm1d očakáva (*, 64) → reshapuj na (B*P*N, 64)
+        x = x.reshape(B * P * N, -1)        # (B*P*N, 64)
+        x = self.bn(x)
         x = F.relu(x)
-        x = x.max(dim=3).values                         # (B, 64, P)
+
+        # Späť na (B, P, N, 64) → max pooling cez body v pilieri
+        x = x.reshape(B, P, N, -1)          # (B, P, N, 64)
+        x = x.max(dim=2).values             # (B, P, 64)
+        x = x.permute(0, 2, 1)             # (B, 64, P)
         return x
 
 
