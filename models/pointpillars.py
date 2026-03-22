@@ -85,9 +85,10 @@ class Backbone2D(nn.Module):
         self.block2 = self._make_block(64,          128, 6, stride=2)
         self.block3 = self._make_block(128,         256, 6, stride=2)
 
-        self.up1 = nn.ConvTranspose2d(64,  128, kernel_size=1, stride=1)
-        self.up2 = nn.ConvTranspose2d(128, 128, kernel_size=2, stride=2)
-        self.up3 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=4)
+        # 1x1 konvolúcie na zjednotenie počtu kanálov
+        self.up1 = nn.Conv2d(64,  128, kernel_size=1)
+        self.up2 = nn.Conv2d(128, 128, kernel_size=1)
+        self.up3 = nn.Conv2d(256, 128, kernel_size=1)
 
     def _make_block(self, in_ch, out_ch, num_layers, stride):
         layers = [
@@ -104,10 +105,20 @@ class Backbone2D(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        x1 = self.block1(x)
-        x2 = self.block2(x1)
-        x3 = self.block3(x2)
-        return torch.cat([self.up1(x1), self.up2(x2), self.up3(x3)], dim=1)
+        x1 = self.block1(x)    # /2
+        x2 = self.block2(x1)   # /4
+        x3 = self.block3(x2)   # /8
+
+        # Upsample x2 a x3 na veľkosť x1 pomocou interpolate
+        target_h, target_w = x1.shape[2], x1.shape[3]
+
+        u1 = self.up1(x1)
+        u2 = F.interpolate(self.up2(x2), size=(target_h, target_w),
+                           mode='bilinear', align_corners=False)
+        u3 = F.interpolate(self.up3(x3), size=(target_h, target_w),
+                           mode='bilinear', align_corners=False)
+
+        return torch.cat([u1, u2, u3], dim=1)   # (B, 384, H, W)
 
 
 # ── Detection Head ────────────────────────────────────────────────
