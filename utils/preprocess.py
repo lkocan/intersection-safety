@@ -233,13 +233,3 @@ if __name__ == '__main__':
         classes = sample['gt_boxes'][:, 7].int().tolist()
         names   = ['Car', 'Pedestrian', 'Cyclist']
         print(f"Objekty:     {[names[c] for c in classes]}")
-```
-
-Ulož ako `utils/preprocess.py` a spusti — mal by si vidieť:
-```
-[DAIRDataset] train: 504x platných vzoriek
-Frame ID:    000000
-Pillars:     (XXXX, 32, 9)
-Coords:      (XXXX, 2)
-GT boxes:    (X, 8)
-Objekty:     ['Cyclist', 'Car', ...]
