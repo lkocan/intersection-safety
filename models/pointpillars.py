@@ -56,25 +56,33 @@ class PillarFeatureNet(nn.Module):
 
 # ── PointPillarScatter ────────────────────────────────────────────
 class PointPillarScatter(nn.Module):
-    def __init__(self, cfg: PointPillarsConfig):
+    def __init__(self, cfg):
         super().__init__()
         self.nx = int((cfg.x_range[1] - cfg.x_range[0]) / cfg.voxel_size[0])
         self.ny = int((cfg.y_range[1] - cfg.y_range[0]) / cfg.voxel_size[1])
 
     def forward(self, pillar_features, coords, batch_size):
         # pillar_features: (B, 64, P)
-        # coords:          (B, P, 2) — [ix, iy]
-        C      = pillar_features.shape[1]
-        canvas = torch.zeros(
-            batch_size, C, self.ny, self.nx,
-            device=pillar_features.device
+        # coords:          (B, P, 2)
+        B, C, P = pillar_features.shape
+        canvas  = torch.zeros(
+            B, C, self.ny, self.nx,
+            dtype  = pillar_features.dtype,
+            device = pillar_features.device
         )
-        for b in range(batch_size):
-            ix   = coords[b, :, 0].long()
-            iy   = coords[b, :, 1].long()
-            mask = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
-            canvas[b, :, iy[mask], ix[mask]] = pillar_features[b, :, mask]
-        return canvas                                    # (B, 64, H, W)
+
+        # Vektorizované scatter — žiadny Python loop
+        ix   = coords[:, :, 0].long().clamp(0, self.nx - 1)  # (B, P)
+        iy   = coords[:, :, 1].long().clamp(0, self.ny - 1)  # (B, P)
+        flat = iy * self.nx + ix                               # (B, P)
+
+        # Rozšír pre všetky kanály
+        flat_exp = flat.unsqueeze(1).expand(B, C, P)          # (B, C, P)
+
+        canvas_flat = canvas.view(B, C, -1)                    # (B, C, H*W)
+        canvas_flat.scatter_(2, flat_exp, pillar_features)
+
+        return canvas_flat.view(B, C, self.ny, self.nx)
 
 
 # ── Backbone ──────────────────────────────────────────────────────
