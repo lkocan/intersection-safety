@@ -8,7 +8,7 @@ from torch.cuda.amp      import GradScaler, autocast   # ← FP16
 
 from models.pointpillars import PointPillars, PointPillarsConfig
 from training.loss       import PointPillarsLoss
-from utils.preprocess    import DAIRDataset
+from utils.preprocess import DAIRDatasetCached as DAIRDataset
 
 
 def collate_fn(batch):
