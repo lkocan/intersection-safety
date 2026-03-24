@@ -375,6 +375,40 @@ class DAIRDataset(Dataset):
             'gt_boxes':   torch.from_numpy(gt_boxes),   # (M, 8)
             'frame_id':   fid,
         }
+        
+class DAIRDatasetCached(Dataset):
+    """
+    Načítava predpočítané .npz súbory — oveľa rýchlejšie ako DAIRDataset.
+    Spusti preprocessing raz, potom používaj toto.
+    """
+
+    def __init__(self, split: str = 'train', cache_dir: str = '/content/dair/cache'):
+        assert split in ('train', 'val', 'test')
+
+        with open(SPLIT_FILE) as f:
+            all_ids = json.load(f)[split]
+
+        self.cache_dir = cache_dir
+        self.ids = [
+            fid for fid in all_ids
+            if os.path.exists(f'{cache_dir}/{fid}.npz')
+        ]
+        print(f'[DAIRDatasetCached] {split}: {len(self.ids)} vzoriek')
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        fid  = self.ids[idx]
+        data = np.load(f'{self.cache_dir}/{fid}.npz')
+
+        return {
+            'pillars':    torch.from_numpy(data['pillars']),
+            'coords':     torch.from_numpy(data['coords']),
+            'num_points': torch.from_numpy(data['num_points']),
+            'gt_boxes':   torch.from_numpy(data['gt_boxes']),
+            'frame_id':   fid,
+        }
 
 
 # ── Rýchly test ───────────────────────────────────────────────────
