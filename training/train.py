@@ -13,11 +13,11 @@ from utils.preprocess import DAIRDatasetCached as DAIRDataset
 
 def collate_fn(batch):
     return {
-        'pillars':    torch.stack([b['pillars']    for b in batch]),
-        'coords':     torch.stack([b['coords']     for b in batch]),
-        'num_points': torch.stack([b['num_points'] for b in batch]),
-        'gt_boxes':   [b['gt_boxes'] for b in batch],
-        'frame_id':   [b['frame_id'] for b in batch],
+        'pillars': torch.stack([b['pillars'] for b in batch], dim=0).float(),
+        'coords': torch.stack([b['coords'] for b in batch], dim=0).int(),
+        'num_points': torch.stack([b['num_points'] for b in batch], dim=0).int(),
+        'gt_boxes': [b['gt_boxes'].float() for b in batch],
+        'frame_id': [b['frame_id'] for b in batch],
     }
 
 
