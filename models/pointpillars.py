@@ -60,38 +60,38 @@ class PointPillarScatter(nn.Module):
         super().__init__()
         self.nx = int((cfg.x_range[1] - cfg.x_range[0]) / cfg.voxel_size[0])
         self.ny = int((cfg.y_range[1] - cfg.y_range[0]) / cfg.voxel_size[1])
+        
+    def forward(self, pillar_features, coords, num_points, batch_size):
+        # pillar_features: (B, 64, P)
+        # coords:          (B, P, 2)
+        # num_points:      (B, P)
+        B, C, P = pillar_features.shape
 
-   def forward(self, pillar_features, coords, num_points, batch_size):
-    # pillar_features: (B, 64, P)
-    # coords:          (B, P, 2)
-    # num_points:      (B, P)
-    B, C, P = pillar_features.shape
-
-    canvas = torch.zeros(
+        canvas = torch.zeros(
         B, C, self.ny, self.nx,
         dtype=pillar_features.dtype,
         device=pillar_features.device
-    )
+        )
 
-    valid_mask = num_points > 0  # (B, P)
+        valid_mask = num_points > 0  # (B, P)
 
-    for b in range(B):
-        valid = valid_mask[b]
-        if valid.sum() == 0:
-            continue
+        for b in range(B):
+            valid = valid_mask[b]
+            if valid.sum() == 0:
+                continue
 
-        feats_b = pillar_features[b, :, valid]     # (C, Pv)
-        coords_b = coords[b, valid]                # (Pv, 2)
+            feats_b = pillar_features[b, :, valid]     # (C, Pv)
+            coords_b = coords[b, valid]                # (Pv, 2)
 
-        ix = coords_b[:, 0].long().clamp(0, self.nx - 1)
-        iy = coords_b[:, 1].long().clamp(0, self.ny - 1)
-        flat = iy * self.nx + ix                   # (Pv,)
+            ix = coords_b[:, 0].long().clamp(0, self.nx - 1)
+            iy = coords_b[:, 1].long().clamp(0, self.ny - 1)
+            flat = iy * self.nx + ix                   # (Pv,)
 
-        canvas_b = canvas[b].view(C, -1)           # (C, H*W)
-        flat_exp = flat.unsqueeze(0).expand(C, -1) # (C, Pv)
-        canvas_b.scatter_(1, flat_exp, feats_b)
+            canvas_b = canvas[b].view(C, -1)           # (C, H*W)
+            flat_exp = flat.unsqueeze(0).expand(C, -1) # (C, Pv)
+            canvas_b.scatter_(1, flat_exp, feats_b)
 
-    return canvas
+        return canvas
 
 
 # ── Backbone ──────────────────────────────────────────────────────
