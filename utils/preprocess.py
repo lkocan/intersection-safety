@@ -243,81 +243,97 @@ def create_pillars(
     nx = int((x_max - x_min) / dx)
     ny = int((y_max - y_min) / dy)
 
+    # Fixný výstupný tvar
+    pillar_out     = np.zeros((max_pillars, max_points_per_pillar, 9), dtype=np.float32)
+    coords_out     = np.zeros((max_pillars, 2), dtype=np.int32)
+    num_points_out = np.zeros((max_pillars,), dtype=np.int32)
+
+    if points.shape[0] == 0:
+        return pillar_out, coords_out, num_points_out
+
     ix = ((points[:, 0] - x_min) / dx).astype(np.int32)
     iy = ((points[:, 1] - y_min) / dy).astype(np.int32)
 
-    valid  = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
+    valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
     points = points[valid]
-    ix     = ix[valid]
-    iy     = iy[valid]
+    ix = ix[valid]
+    iy = iy[valid]
 
-    if len(points) == 0:
-        empty = np.zeros((1, max_points_per_pillar, 9), dtype=np.float32)
-        return empty, np.zeros((1, 2), dtype=np.int32), np.zeros(1, dtype=np.int32)
+    if points.shape[0] == 0:
+        return pillar_out, coords_out, num_points_out
 
-    pillar_key           = iy * nx + ix
+    pillar_key = iy * nx + ix
     unique_keys, inverse = np.unique(pillar_key, return_inverse=True)
 
+    # Ak je pilierov priveľa, nechaj tie s najviac bodmi
     if len(unique_keys) > max_pillars:
-        # Nechaj piliere s najviac bodmi
-        counts     = np.bincount(inverse, minlength=len(unique_keys))
-        top_idx    = np.argsort(-counts)[:max_pillars]
-        key_map    = np.full(len(unique_keys), -1, dtype=np.int32)
-        key_map[top_idx] = np.arange(max_pillars, dtype=np.int32)
-        new_inverse = key_map[inverse]
-        mask        = new_inverse >= 0
-        points      = points[mask]
-        inverse     = new_inverse[mask]
+        counts = np.bincount(inverse, minlength=len(unique_keys))
+        top_idx = np.argsort(-counts)[:max_pillars]
+
+        keep_mask_keys = np.zeros(len(unique_keys), dtype=bool)
+        keep_mask_keys[top_idx] = True
+        keep_mask_points = keep_mask_keys[inverse]
+
+        points = points[keep_mask_points]
+        inverse = inverse[keep_mask_points]
+
+        old_to_new = -np.ones(len(unique_keys), dtype=np.int32)
+        old_to_new[top_idx] = np.arange(len(top_idx), dtype=np.int32)
+        inverse = old_to_new[inverse]
         unique_keys = unique_keys[top_idx]
 
     P = len(unique_keys)
+    if P == 0:
+        return pillar_out, coords_out, num_points_out
 
-    # ── Vektorizovaná verzia bez Python for loop ──────────────────
-    # Zoraď body podľa piliera
-    sort_idx = np.argsort(inverse, kind='stable')
-    points   = points[sort_idx]
-    inverse  = inverse[sort_idx]
+    # Súradnice pilierov
+    px = (unique_keys % nx).astype(np.int32)
+    py = (unique_keys // nx).astype(np.int32)
 
-    # Počet bodov v každom pilieri
-    num_points_out = np.bincount(inverse, minlength=P).astype(np.int32)
-    num_points_out = np.minimum(num_points_out, max_points_per_pillar)
+    coords_out[:P, 0] = px
+    coords_out[:P, 1] = py
 
-    # Centroidy pilárov (vektorizovane)
-    cx = x_min + (unique_keys % nx + 0.5) * dx
-    cy = y_min + (unique_keys // nx + 0.5) * dy
+    # Centrá pilierov v metroch
+    cx = x_min + (px + 0.5) * dx
+    cy = y_min + (py + 0.5) * dy
 
-    # Globálne priemery
+    # Globálne priemery frameu
     global_mean_x = points[:, 0].mean()
     global_mean_y = points[:, 1].mean()
 
-    # Naplň pilier_out vektorizovane
-    pillar_out = np.zeros((P, max_points_per_pillar, 9), dtype=np.float32)
+    # Stabilné zoradenie podľa pillar id
+    sort_idx = np.argsort(inverse, kind='stable')
+    points = points[sort_idx]
+    inverse = inverse[sort_idx]
 
-    # Kumulatívne offsety pre každý pilier
-    offsets = np.concatenate([[0], np.cumsum(np.bincount(inverse, minlength=P))])
+    counts = np.bincount(inverse, minlength=P)
+    offsets = np.concatenate([[0], np.cumsum(counts)])
 
     for pid in range(P):
         start = offsets[pid]
-        n     = num_points_out[pid]
-        p     = points[start: start + n]
+        end = offsets[pid + 1]
+        pts = points[start:end]
 
-        cz = p[:, 2].mean()
+        n = min(len(pts), max_points_per_pillar)
+        if n == 0:
+            continue
 
-        pillar_out[pid, :n, 0] = p[:, 0]
-        pillar_out[pid, :n, 1] = p[:, 1]
-        pillar_out[pid, :n, 2] = p[:, 2]
-        pillar_out[pid, :n, 3] = p[:, 3]
-        pillar_out[pid, :n, 4] = p[:, 0] - cx[pid]
-        pillar_out[pid, :n, 5] = p[:, 1] - cy[pid]
-        pillar_out[pid, :n, 6] = p[:, 2] - cz
-        pillar_out[pid, :n, 7] = p[:, 0] - global_mean_x
-        pillar_out[pid, :n, 8] = p[:, 1] - global_mean_y
+        pts = pts[:n]
+        num_points_out[pid] = n
 
-    coords = np.stack(
-        [unique_keys % nx, unique_keys // nx], axis=1
-    ).astype(np.int32)
+        cz = pts[:, 2].mean()
 
-    return pillar_out, coords, num_points_out
+        pillar_out[pid, :n, 0] = pts[:, 0]
+        pillar_out[pid, :n, 1] = pts[:, 1]
+        pillar_out[pid, :n, 2] = pts[:, 2]
+        pillar_out[pid, :n, 3] = pts[:, 3]
+        pillar_out[pid, :n, 4] = pts[:, 0] - cx[pid]
+        pillar_out[pid, :n, 5] = pts[:, 1] - cy[pid]
+        pillar_out[pid, :n, 6] = pts[:, 2] - cz
+        pillar_out[pid, :n, 7] = pts[:, 0] - global_mean_x
+        pillar_out[pid, :n, 8] = pts[:, 1] - global_mean_y
+
+    return pillar_out, coords_out, num_points_out
 
 
 # ── Dataset ───────────────────────────────────────────────────────
