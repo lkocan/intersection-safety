@@ -61,28 +61,37 @@ class PointPillarScatter(nn.Module):
         self.nx = int((cfg.x_range[1] - cfg.x_range[0]) / cfg.voxel_size[0])
         self.ny = int((cfg.y_range[1] - cfg.y_range[0]) / cfg.voxel_size[1])
 
-    def forward(self, pillar_features, coords, batch_size):
-        # pillar_features: (B, 64, P)
-        # coords:          (B, P, 2)
-        B, C, P = pillar_features.shape
-        canvas  = torch.zeros(
-            B, C, self.ny, self.nx,
-            dtype  = pillar_features.dtype,
-            device = pillar_features.device
-        )
+   def forward(self, pillar_features, coords, num_points, batch_size):
+    # pillar_features: (B, 64, P)
+    # coords:          (B, P, 2)
+    # num_points:      (B, P)
+    B, C, P = pillar_features.shape
 
-        # Vektorizované scatter — žiadny Python loop
-        ix   = coords[:, :, 0].long().clamp(0, self.nx - 1)  # (B, P)
-        iy   = coords[:, :, 1].long().clamp(0, self.ny - 1)  # (B, P)
-        flat = iy * self.nx + ix                               # (B, P)
+    canvas = torch.zeros(
+        B, C, self.ny, self.nx,
+        dtype=pillar_features.dtype,
+        device=pillar_features.device
+    )
 
-        # Rozšír pre všetky kanály
-        flat_exp = flat.unsqueeze(1).expand(B, C, P)          # (B, C, P)
+    valid_mask = num_points > 0  # (B, P)
 
-        canvas_flat = canvas.view(B, C, -1)                    # (B, C, H*W)
-        canvas_flat.scatter_(2, flat_exp, pillar_features)
+    for b in range(B):
+        valid = valid_mask[b]
+        if valid.sum() == 0:
+            continue
 
-        return canvas_flat.view(B, C, self.ny, self.nx)
+        feats_b = pillar_features[b, :, valid]     # (C, Pv)
+        coords_b = coords[b, valid]                # (Pv, 2)
+
+        ix = coords_b[:, 0].long().clamp(0, self.nx - 1)
+        iy = coords_b[:, 1].long().clamp(0, self.ny - 1)
+        flat = iy * self.nx + ix                   # (Pv,)
+
+        canvas_b = canvas[b].view(C, -1)           # (C, H*W)
+        flat_exp = flat.unsqueeze(0).expand(C, -1) # (C, Pv)
+        canvas_b.scatter_(1, flat_exp, feats_b)
+
+    return canvas
 
 
 # ── Backbone ──────────────────────────────────────────────────────
@@ -157,7 +166,7 @@ class PointPillars(nn.Module):
 
     def forward(self, pillars, coords, num_points, batch_size):
         features     = self.pfn(pillars, num_points)
-        bev_map      = self.scatter(features, coords, batch_size)
+        bev_map = self.scatter(features, coords, num_points, batch_size)
         backbone_out = self.backbone(bev_map)
         cls, reg, dir = self.head(backbone_out)
         return {'cls': cls, 'reg': reg, 'dir': dir}
