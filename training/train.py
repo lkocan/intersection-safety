@@ -1,7 +1,8 @@
 import sys
-sys.path.append('.')
-
 import os
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 import torch
 from torch.utils.data    import DataLoader
 from torch.cuda.amp      import GradScaler, autocast   # ← FP16
