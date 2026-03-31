@@ -22,7 +22,7 @@ def collate_fn(batch):
     }
 
 
-def train(cfg, device, save_dir='/content/checkpoints'):
+def train(cfg, device, save_dir='/content/checkpoints', start_epoch=0):
     os.makedirs(save_dir, exist_ok=True)
 
     train_ds = DAIRDataset(split='train')
@@ -68,7 +68,7 @@ def train(cfg, device, save_dir='/content/checkpoints'):
 
     best_val_loss = float('inf')
 
-    for epoch in range(cfg.num_epochs):
+    for epoch in range(start_epoch, cfg.num_epochs):
         # ── Tréning ───────────────────────────────────────────────
         model.train()
         train_losses = []
