@@ -1,79 +1,65 @@
+import os
 import sys
-sys.path.append('.')
-
+import torch
 import numpy as np
-from utils.preprocess import (
-    load_pcd, load_labels, filter_pointcloud,
-    create_pillars, DAIRDataset,
-    PCD_DIR, LABEL_DIR,
-)
+import cv2
+import json
 
-CLASS_NAMES = ['Car', 'Pedestrian', 'Cyclist']
+# Pridanie ciest k modulom (podľa toho, kde máš projekt na disku)
+# Ak spúšťaš priamo z priečinka projektu, stačí '.'
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(PROJECT_ROOT)
 
-# ── Test 1: PCD reader ────────────────────────────────────────────
-print("=" * 50)
-print("TEST 1: Načítanie PCD súboru")
-print("=" * 50)
+from models.pointpillars import PointPillars, PointPillarsConfig
+from tracking.tracker import Tracker3D
+from utils.roi_utils import calculate_risk_score
 
-test_pcd = f'{PCD_DIR}/008065.pcd'
-points   = load_pcd(test_pcd)
-print(f"Shape:       {points.shape}")
-print(f"Prvé 3 body:\n{points[:3]}")
-print(f"X rozsah:    {points[:,0].min():.1f} až {points[:,0].max():.1f} m")
-print(f"Y rozsah:    {points[:,1].min():.1f} až {points[:,1].max():.1f} m")
-print(f"Z rozsah:    {points[:,2].min():.1f} až {points[:,2].max():.1f} m")
-print(f"Intensity:   {points[:,3].min():.3f} až {points[:,3].max():.3f}")
+def get_device():
+    """Inteligentná detekcia hardvéru."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        # Špecifické pre tvoj Mac M4
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
 
-# ── Test 2: Filtrovanie ───────────────────────────────────────────
-print("\n" + "=" * 50)
-print("TEST 2: Filtrovanie ROI")
-print("=" * 50)
+def load_model(cfg, checkpoint_path, device):
+    """Bezpečné načítanie modelu naprieč platformami."""
+    model = PointPillars(cfg).to(device)
+    
+    if os.path.exists(checkpoint_path):
+        # Kľúčové: map_location zabezpečí, že váhy z CUDA (Colab) 
+        # sa správne namapujú na MPS (Mac) alebo CPU
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['state_dict'])
+        print(f"Model úspešne načítaný na zariadenie: {device}")
+    else:
+        print(f"Checkpoint '{checkpoint_path}' nenájdený. Model beží s náhodnými váhami.")
+    
+    model.eval()
+    return model
 
-filtered = filter_pointcloud(points)
-print(f"Pred filtrom: {len(points):,} bodov")
-print(f"Po filtri:    {len(filtered):,} bodov")
+def main():
+    device = get_device()
+    cfg = PointPillarsConfig()
+    
+    # Nastav cestu k tvojmu checkpointu (relatívne k projektu)
+    ckpt_path = os.path.join(PROJECT_ROOT, 'checkpoints', 'last.pth')
+    
+    model = load_model(cfg, ckpt_path, device)
+    tracker = Tracker3D()
 
-# ── Test 3: Labely ────────────────────────────────────────────────
-print("\n" + "=" * 50)
-print("TEST 3: Načítanie labelov")
-print("=" * 50)
+    print("--- Systém pripravený na testovanie ---")
+    
+    # Simulácia vizualizácie
+    # V Colabe by sme použili cv2_imshow, na Macu klasické cv2.imshow
+    is_colab = 'google.colab' in sys.modules
 
-label_path = f'{LABEL_DIR}/008065.json'
-boxes      = load_labels(label_path)
-print(f"Počet objektov: {len(boxes)}")
-for b in boxes:
-    print(f"  {b.obj_type:12s}  "
-          f"x={b.x:6.1f}  y={b.y:6.1f}  z={b.z:5.1f}  "
-          f"l={b.length:.2f}  w={b.width:.2f}  h={b.height:.2f}  "
-          f"class_id={b.class_id}")
+    # Tu by nasledovala tvoja slučka spracovania dát...
+    # frame_data = dataset[0]
+    # detections = model_inference(model, frame_data, device)
+    # confirmed = tracker.update(detections)
 
-# ── Test 4: Piliere ───────────────────────────────────────────────
-print("\n" + "=" * 50)
-print("TEST 4: Tvorba pilárov")
-print("=" * 50)
-
-pillars, coords, num_pts = create_pillars(filtered)
-print(f"Pillars shape:    {pillars.shape}")
-print(f"Coords shape:     {coords.shape}")
-print(f"Num points shape: {num_pts.shape}")
-print(f"Priemerný počet bodov v pilieri: {num_pts.mean():.1f}")
-
-# ── Test 5: Dataset ───────────────────────────────────────────────
-print("\n" + "=" * 50)
-print("TEST 5: DAIRDataset")
-print("=" * 50)
-
-ds     = DAIRDataset(split='train')
-sample = ds[0]
-print(f"\nFrame ID:   {sample['frame_id']}")
-print(f"Pillars:    {sample['pillars'].shape}")
-print(f"Coords:     {sample['coords'].shape}")
-print(f"GT boxes:   {sample['gt_boxes'].shape}")
-
-if len(sample['gt_boxes']) > 0:
-    classes = sample['gt_boxes'][:, 7].int().tolist()
-    print(f"Objekty:    {[CLASS_NAMES[c] for c in classes]}")
-else:
-    print("Objekty:    žiadne anotované objekty v tomto frame")
-
-print("\n✓ Všetky testy prebehli úspešne!")
+if __name__ == "__main__":
+    main()
