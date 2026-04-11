@@ -1,15 +1,20 @@
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from enum import Enum
+from utils.roi_utils import filter_detections_by_roi
 
+class TrackState(Enum):
+    TENTATIVE = 1
+    CONFIRMED = 2
+    DELETED = 3
 
 class KalmanFilter3D:
     """Stav: [x, y, z, l, w, h, rot, vx, vy, vz]"""
-
     def __init__(self, bbox: np.ndarray):
         self.F = np.eye(10, dtype=np.float32)
-        self.F[0, 7] = 1.0
-        self.F[1, 8] = 1.0
-        self.F[2, 9] = 1.0
+        self.F[0, 7] = 1.0  # x = x + vx
+        self.F[1, 8] = 1.0  # y = y + vy
+        self.F[2, 9] = 1.0  # z = z + vz
 
         self.H = np.zeros((7, 10), dtype=np.float32)
         self.H[:7, :7] = np.eye(7)
@@ -28,181 +33,115 @@ class KalmanFilter3D:
         self.x = np.zeros(10, dtype=np.float32)
         self.x[:7] = bbox
 
-    def predict(self) -> np.ndarray:
+    def predict(self):
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
         return self.x[:7]
 
     def update(self, bbox: np.ndarray):
-        y = bbox - self.H @ self.x
+        y = bbox - (self.H @ self.x)
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + K @ y
-        self.P = (np.eye(10, dtype=np.float32) - K @ self.H) @ self.P
-
-    def get_state(self) -> np.ndarray:
-        return self.x[:7].copy()
-
-    @property
-    def velocity(self) -> np.ndarray:
-        """Vráti [vx, vy] v m/frame."""
-        return self.x[7:9].copy()
-
+        self.x = self.x + (K @ y)
+        self.P = (np.eye(10) - (K @ self.H)) @ self.P
 
 class Track:
-    _id_counter = 0
-
-    def __init__(self, bbox: np.ndarray, class_id: int, score: float):
-        Track._id_counter += 1
-        self.id = Track._id_counter
-        self.class_id = class_id
+    def __init__(self, bbox, class_id, score, track_id):
+        self.id = track_id
+        self.class_id = int(class_id)
         self.score = score
         self.kf = KalmanFilter3D(bbox)
-
+        self.state = TrackState.TENTATIVE
         self.hits = 1
         self.age = 1
         self.time_since_update = 0
-        self.updated_this_frame = True
+        self.history = []
+        self.smoothed_risk = 0.0
+        self.alpha_risk = 0.2
 
-        self.history = [bbox[:3].copy()]
-
-    def predict(self) -> np.ndarray:
+    def predict(self):
         self.age += 1
         self.time_since_update += 1
-        self.updated_this_frame = False
-        return self.kf.predict()
+        pos = self.kf.predict()
+        self.history.append(pos[:3].copy())
+        if len(self.history) > 50:
+            self.history.pop(0)
+        return pos
 
-    def update(self, bbox: np.ndarray, score: float):
+    def update(self, bbox):
         self.hits += 1
         self.time_since_update = 0
-        self.updated_this_frame = True
-        self.score = score
         self.kf.update(bbox)
-        self.history.append(self.kf.get_state()[:3].copy())
 
-    @property
-    def state(self) -> np.ndarray:
-        return self.kf.get_state()
-
-    @property
-    def velocity(self) -> np.ndarray:
-        return self.kf.velocity
-
-
-def iou_bev(a: np.ndarray, b: np.ndarray) -> float:
-    ax1, ax2 = a[0] - a[3] / 2, a[0] + a[3] / 2
-    ay1, ay2 = a[1] - a[4] / 2, a[1] + a[4] / 2
-    bx1, bx2 = b[0] - b[3] / 2, b[0] + b[3] / 2
-    by1, by2 = b[1] - b[4] / 2, b[1] + b[4] / 2
-
-    ix = max(0, min(ax2, bx2) - max(ax1, bx1))
-    iy = max(0, min(ay2, by2) - max(ay1, by1))
-    inter = ix * iy
-    union = a[3] * a[4] + b[3] * b[4] - inter
-    return inter / union if union > 0 else 0.0
-
-
-def center_distance(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2))
-
+    def update_risk(self, new_risk):
+        self.smoothed_risk = (1 - self.alpha_risk) * self.smoothed_risk + self.alpha_risk * new_risk
 
 class Tracker3D:
-    def __init__(
-        self,
-        max_age: int = 1,
-        min_hits: int = 3,
-        dist_threshold: float = 4.0,
-    ):
+    def __init__(self, max_age=10, min_hits=3, dist_threshold=4.0, roi_coords=None):
         self.max_age = max_age
         self.min_hits = min_hits
         self.dist_threshold = dist_threshold
+        self.roi_coords = roi_coords
         self.tracks = []
-        self.frame_count = 0
+        self._next_id = 1
 
-    def update(self, detections: np.ndarray) -> list:
-        """
-        detections: (N, 9) — [x,y,z,l,w,h,rot,class_id,score]
-        Vráti len confirmed tracky, ktoré boli update-nuté v aktuálnom frame.
-        """
-        self.frame_count += 1
+    def update(self, detections: np.ndarray):
+        # 1. ROI Filtrovanie detekcií
+        if self.roi_coords is not None:
+            detections = filter_detections_by_roi(detections, self.roi_coords)
 
-        predicted = [t.predict() for t in self.tracks]
+        # 2. Predikcia Kalmanovho filtra
+        predicted_states = [t.predict() for t in self.tracks]
 
-        if len(self.tracks) > 0 and len(detections) > 0:
-            matched, unmatched_dets, unmatched_trks = self._associate(
-                detections, predicted
-            )
-        else:
-            matched = []
-            unmatched_dets = list(range(len(detections)))
-            unmatched_trks = list(range(len(self.tracks)))
+        # 3. Asociácia (Class-aware Hungarian)
+        matched, unmatched_dets, unmatched_trks = self._associate(detections, predicted_states)
 
+        # 4. Aktualizácia spárovaných trackov
         for d_idx, t_idx in matched:
-            self.tracks[t_idx].update(detections[d_idx][:7], float(detections[d_idx][8]))
+            self.tracks[t_idx].update(detections[d_idx][:7])
+            if self.tracks[t_idx].state == TrackState.TENTATIVE and self.tracks[t_idx].hits >= self.min_hits:
+                self.tracks[t_idx].state = TrackState.CONFIRMED
 
+        # 5. Vytvorenie nových trackov
         for d_idx in unmatched_dets:
             d = detections[d_idx]
-            self.tracks.append(Track(d[:7], int(d[7]), float(d[8])))
+            new_track = Track(d[:7], d[7], d[8], self._next_id)
+            self.tracks.append(new_track)
+            self._next_id += 1
 
-        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+        # 6. Správa životného cyklu
+        for t_idx in unmatched_trks:
+            if self.tracks[t_idx].time_since_update > self.max_age:
+                self.tracks[t_idx].state = TrackState.DELETED
 
-        results = []
-        for t in self.tracks:
-            if t.hits < self.min_hits:
-                continue
-            if not t.updated_this_frame:
-                continue
-
-            s = t.state
-            results.append({
-                'id': t.id,
-                'class_id': t.class_id,
-                'x': float(s[0]),
-                'y': float(s[1]),
-                'z': float(s[2]),
-                'l': float(s[3]),
-                'w': float(s[4]),
-                'h': float(s[5]),
-                'rot': float(s[6]),
-                'vx': float(t.velocity[0]),
-                'vy': float(t.velocity[1]),
-                'score': t.score,
-                'age': t.age,
-                'hits': t.hits,
-                'time_since_update': t.time_since_update,
-                'updated_this_frame': t.updated_this_frame,
-                'history': [p.tolist() for p in t.history],
-            })
-        return results
+        self.tracks = [t for t in self.tracks if t.state != TrackState.DELETED]
+        
+        # Vráti len potvrdené objekty pre vizualizáciu/logovanie
+        return [t for t in self.tracks if t.state == TrackState.CONFIRMED]
 
     def _associate(self, detections, predicted):
-        n_det = len(detections)
-        n_trk = len(predicted)
+        n_det, n_trk = len(detections), len(self.tracks)
+        if n_det == 0 or n_trk == 0:
+            return [], list(range(n_det)), list(range(n_trk))
+
         cost = np.full((n_det, n_trk), 1e6, dtype=np.float32)
 
         for d_i, det in enumerate(detections):
-            for t_i, pred in enumerate(predicted):
-                dist = center_distance(det[:7], pred)
-                if dist <= self.dist_threshold:
-                    iou = iou_bev(det[:7], pred)
-                    cost[d_i, t_i] = dist * (1.0 - iou)
+            for t_i, trk in enumerate(self.tracks):
+                if int(det[7]) != trk.class_id:
+                    continue
+                dist = np.linalg.norm(det[:2] - predicted[t_i][:2])
+                if dist < self.dist_threshold:
+                    cost[d_i, t_i] = dist
 
-        d_idx, t_idx = linear_sum_assignment(cost)
-
+        row_ind, col_ind = linear_sum_assignment(cost)
+        
         matched = []
-        unmatched_dets = list(range(n_det))
-        unmatched_trks = list(range(n_trk))
-
-        for d, t in zip(d_idx, t_idx):
-            if cost[d, t] >= 1e6:
-                continue
-            matched.append((d, t))
-            unmatched_dets.remove(d)
-            unmatched_trks.remove(t)
-
+        for r, c in zip(row_ind, col_ind):
+            if cost[r, c] < 1e6:
+                matched.append((r, c))
+            
+        unmatched_dets = [i for i in range(n_det) if i not in [m[0] for m in matched]]
+        unmatched_trks = [i for i in range(n_trk) if i not in [m[1] for m in matched]]
+        
         return matched, unmatched_dets, unmatched_trks
-
-    def reset(self):
-        self.tracks = []
-        self.frame_count = 0
-        Track._id_counter = 0
