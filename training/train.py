@@ -39,7 +39,7 @@ def train(cfg, device, save_dir='./checkpoints_v2', start_epoch=0):
         train_ds,
         batch_size       = cfg.batch_size,
         shuffle          = True,
-        num_workers      = 4,                 # Prispôsob podľa počtu jadier na Macu
+        num_workers      = 8,                 # Prispôsob podľa počtu jadier na Macu
         collate_fn       = collate_fn,
         pin_memory       = (device.type == 'cuda'), # Iba pre NVIDIA GPU
         persistent_workers = True,
@@ -50,7 +50,7 @@ def train(cfg, device, save_dir='./checkpoints_v2', start_epoch=0):
         val_ds,
         batch_size       = cfg.batch_size,
         shuffle          = False,
-        num_workers      = 4,
+        num_workers      = 8,
         collate_fn       = collate_fn,
     )
 
