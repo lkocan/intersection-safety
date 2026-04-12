@@ -11,6 +11,10 @@ def main():
 
     vis = o3d.visualization.Visualizer()
     vis.create_window(window_name="M4 PointPillars Monitor", width=1280, height=720)
+    # Zväčšenie bodov (na Macu odporúčam 2.0 až 5.0)
+    render_option = vis.get_render_option()
+    render_option.point_size = 3.0
+    render_option.background_color = np.array([0.05, 0.05, 0.05]) # Tmavošedé pozadie
     
     pcd_o3d = o3d.geometry.PointCloud()
     vis.add_geometry(pcd_o3d)
