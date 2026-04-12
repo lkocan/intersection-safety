@@ -61,16 +61,14 @@ def main():
 
     # 4. NAČÍTANIE SUROVÉHO DATASETU
     try:
-        # Používame DAIRDataset (nie Cached), ktorý číta PCD priamo z disku
-        dataset = DAIRDataset(
-            split='val', 
-            root_path=DATA_PATH
-        )
-        print(f"✓ Dataset úspešne inicializovaný z: {DATA_PATH}")
+    # Ak tvoj __init__ v preprocess.py vyzerá takto: def __init__(self, split):
+        dataset = DAIRDataset(split='val')
+        print(f"Dataset úspešne inicializovaný.")
+        print(f"Cesty v preprocess.py: {DAIR_ROOT}")
     except Exception as e:
-        print(f"Chyba pri načítaní dát: {e}")
-        print(f"Uisti sa, že v {DATA_PATH} sú priečinky 'pcd' a 'label'.")
-        return
+        print(f" Chyba pri načítaní datasetu: {e}")
+        print("Skontroluj v preprocess.py, či __init__ vôbec prijíma nejaké argumenty.")
+    return
 
     # 5. TESTOVACIA SLUČKA
     for i in range(len(dataset)):
