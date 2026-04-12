@@ -9,11 +9,19 @@ from typing import List, Tuple
 import torch
 from torch.utils.data import Dataset
 
-# ── Konfigurácia ciest ────────────────────────────────────────────
-DAIR_ROOT  = '/Users/lkocan/Documents/intersection-safety-1/data'
-PCD_DIR    = f'{DAIR_ROOT}/pcd'
-LABEL_DIR  = f'{DAIR_ROOT}/label/virtuallidar'
-SPLIT_FILE = f'{DAIR_ROOT}/split_data.json'
+# ── UNIVERZÁLNA KONFIGURÁCIA CIEST ────────────────────────────────
+# BASE_DIR zistí cestu k priečinku "intersection-safety-1"
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+DAIR_ROOT  = BASE_DIR / 'data'
+PCD_DIR    = DAIR_ROOT / 'pcd'
+LABEL_DIR  = DAIR_ROOT / 'label' / 'virtuallidar'
+SPLIT_FILE = DAIR_ROOT / 'split_data.json'
+GT_DB_DIR  = BASE_DIR / 'gt_database'
+
+# Pomocná funkcia na prevod Path objektov na stringy pre kompatibilitu s open()
+def p(path_obj):
+    return str(path_obj)
 
 # ── Dátová štruktúra ──────────────────────────────────────────────
 @dataclass
@@ -60,8 +68,11 @@ def lzf_decompress(data: bytes, output_size: int) -> bytes:
                 out_pos += 1
     return bytes(output)
 
-# ── Načítanie PCD ─────────────────────────────────────────────────
+# ── Načítanie PCD (Univerzálne, bez Open3D) ────────────────────────
 def load_pcd(pcd_path: str) -> np.ndarray:
+    if not os.path.exists(pcd_path):
+        return np.zeros((0, 4), dtype=np.float32)
+        
     with open(pcd_path, 'rb') as f:
         header = {}
         while True:
@@ -138,6 +149,7 @@ def load_pcd(pcd_path: str) -> np.ndarray:
 
 # ── Načítanie labelov ─────────────────────────────────────────────
 def load_labels(label_path: str) -> List[Box3D]:
+    if not os.path.exists(label_path): return []
     with open(label_path, encoding='utf-8') as f:
         data = json.load(f)
     boxes = []
@@ -159,12 +171,7 @@ def load_labels(label_path: str) -> List[Box3D]:
     return boxes
 
 # ── Filtrovanie ROI ───────────────────────────────────────────────
-def filter_pointcloud(
-    points:  np.ndarray,
-    x_range: Tuple = (0, 200),
-    y_range: Tuple = (-50, 50),
-    z_range: Tuple = (-3,  3),
-) -> np.ndarray:
+def filter_pointcloud(points, x_range=(0, 200), y_range=(-50, 50), z_range=(-3, 3)):
     mask = (
         (points[:, 0] >= x_range[0]) & (points[:, 0] <= x_range[1]) &
         (points[:, 1] >= y_range[0]) & (points[:, 1] <= y_range[1]) &
@@ -174,20 +181,19 @@ def filter_pointcloud(
 
 # ── GT SAMPLER (AUGMENTÁCIA) ──────────────────────────────────────
 class GTSampler:
-    def __init__(self, db_path='gt_database'):
+    def __init__(self, db_path=GT_DB_DIR):
         self.db_path = db_path
-        info_path = os.path.join(db_path, 'gt_database_info.pkl')
-        if not os.path.exists(info_path):
+        info_path = db_path / 'gt_database_info.pkl'
+        if not info_path.exists():
             print(f"⚠️ GTSampler: {info_path} nenájdený!")
             self.db_info = {}
         else:
-            with open(info_path, 'rb') as f:
+            with open(p(info_path), 'rb') as f:
                 self.db_info = pickle.load(f)
         self.class_map = {'Car': 0, 'Pedestrian': 1, 'Cyclist': 2}
 
     def sample(self, existing_boxes, max_ped=8, max_cyc=8):
-        sampled_pts = []
-        sampled_boxes = []
+        sampled_pts, sampled_boxes = [], []
         all_boxes = existing_boxes.copy() if len(existing_boxes) > 0 else np.empty((0, 8))
         
         for cls_name, max_count in [('Pedestrian', max_ped), ('Cyclist', max_cyc)]:
@@ -199,173 +205,103 @@ class GTSampler:
             
             for idx in choices:
                 info = available[idx]
-                pts = np.load(os.path.join(self.db_path, info['filepath']))
+                pts = np.load(p(self.db_path / info['filepath']))
                 l, w, h = info['box_dims']
                 
-                x = np.random.uniform(10.0, 70.0) # ROI pre vkladanie
-                y = np.random.uniform(-35.0, 35.0)
-                z = -1.5 
-                yaw = np.random.uniform(0, 2 * np.pi)
+                x, y, z, yaw = np.random.uniform(10, 70), np.random.uniform(-35, 35), -1.5, np.random.uniform(0, 2*np.pi)
                 
                 if len(all_boxes) > 0:
                     centers = all_boxes[:, :2]
-                    dists = np.sqrt(np.sum((centers - [x, y])**2, axis=1))
-                    if np.any(dists < 3.5): continue
+                    if np.any(np.sqrt(np.sum((centers - [x, y])**2, axis=1)) < 3.5): continue
                 
                 cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-                R = np.array([[cos_y, -sin_y, 0], [sin_y, cos_y, 0], [0, 0, 1]])
+                R = np.array([[cos_y, -sin_y, 0], [sin_y,  cos_y, 0], [0, 0, 1]])
                 
                 new_pts = pts.copy()
-                new_pts[:, :3] = np.dot(pts[:, :3], R.T)
-                new_pts[:, 0] += x
-                new_pts[:, 1] += y
-                new_pts[:, 2] += z
-                
+                new_pts[:, :3] = np.dot(pts[:, :3], R.T) + [x, y, z]
                 new_box = np.array([x, y, z, l, w, h, yaw, self.class_map[cls_name]])
+                
                 sampled_pts.append(new_pts)
                 sampled_boxes.append(new_box)
                 all_boxes = np.vstack([all_boxes, new_box])
         return sampled_pts, sampled_boxes
 
 # ── Tvorba pilárov ────────────────────────────────────────────────
-def create_pillars(
-    points:                np.ndarray,
-    voxel_size:            Tuple = (0.2, 0.2),
-    x_range:               Tuple = (0, 200),
-    y_range:               Tuple = (-50, 50),
-    max_points_per_pillar: int   = 32,
-    max_pillars:           int   = 12000,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def create_pillars(points, voxel_size=(0.2, 0.2), x_range=(0, 200), y_range=(-50, 50), max_points_per_pillar=32, max_pillars=12000):
     dx, dy = voxel_size
     x_min, x_max = x_range
     y_min, y_max = y_range
-    nx = int((x_max - x_min) / dx)
-    ny = int((y_max - y_min) / dy)
+    nx, ny = int((x_max - x_min) / dx), int((y_max - y_min) / dy)
 
-    pillar_out     = np.zeros((max_pillars, max_points_per_pillar, 9), dtype=np.float32)
-    coords_out     = np.zeros((max_pillars, 2), dtype=np.int32)
-    num_points_out = np.zeros((max_pillars,), dtype=np.int32)
+    p_out, c_out, n_out = np.zeros((max_pillars, max_points_per_pillar, 9), dtype=np.float32), \
+                           np.zeros((max_pillars, 2), dtype=np.int32), \
+                           np.zeros((max_pillars,), dtype=np.int32)
 
-    if points.shape[0] == 0: return pillar_out, coords_out, num_points_out
+    if points.shape[0] == 0: return p_out, c_out, n_out
 
-    ix = ((points[:, 0] - x_min) / dx).astype(np.int32)
-    iy = ((points[:, 1] - y_min) / dy).astype(np.int32)
+    ix, iy = ((points[:, 0] - x_min) / dx).astype(np.int32), ((points[:, 1] - y_min) / dy).astype(np.int32)
     valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
-    points = points[valid]
-    ix, iy = ix[valid], iy[valid]
+    points, ix, iy = points[valid], ix[valid], iy[valid]
 
-    if points.shape[0] == 0: return pillar_out, coords_out, num_points_out
+    if points.shape[0] == 0: return p_out, c_out, n_out
 
     pillar_key = iy * nx + ix
-    unique_keys, inverse = np.unique(pillar_key, return_inverse=True)
+    u_keys, inverse = np.unique(pillar_key, return_inverse=True)
 
-    if len(unique_keys) > max_pillars:
-        counts = np.bincount(inverse, minlength=len(unique_keys))
-        top_idx = np.argsort(-counts)[:max_pillars]
-        keep_mask_keys = np.zeros(len(unique_keys), dtype=bool)
-        keep_mask_keys[top_idx] = True
-        keep_mask_points = keep_mask_keys[inverse]
-        points = points[keep_mask_points]
-        inverse = inverse[keep_mask_points]
-        old_to_new = -np.ones(len(unique_keys), dtype=np.int32)
-        old_to_new[top_idx] = np.arange(len(top_idx), dtype=np.int32)
-        inverse = old_to_new[inverse]
-        unique_keys = unique_keys[top_idx]
+    if len(u_keys) > max_pillars:
+        top_idx = np.argsort(-np.bincount(inverse, minlength=len(u_keys)))[:max_pillars]
+        mask = np.isin(inverse, top_idx)
+        points, inverse = points[mask], np.unique(inverse[mask], return_inverse=True)[1]
+        u_keys = u_keys[top_idx]
 
-    P = len(unique_keys)
-    px, py = (unique_keys % nx).astype(np.int32), (unique_keys // nx).astype(np.int32)
-    coords_out[:P, 0], coords_out[:P, 1] = px, py
+    P = len(u_keys)
+    px, py = (u_keys % nx).astype(np.int32), (u_keys // nx).astype(np.int32)
+    c_out[:P, 0], c_out[:P, 1] = px, py
     cx, cy = x_min + (px + 0.5) * dx, y_min + (py + 0.5) * dy
-    global_mean_x, global_mean_y = points[:, 0].mean(), points[:, 1].mean()
+    gm_x, gm_y = points[:, 0].mean(), points[:, 1].mean()
 
     sort_idx = np.argsort(inverse, kind='stable')
     points, inverse = points[sort_idx], inverse[sort_idx]
-    counts = np.bincount(inverse, minlength=P)
-    offsets = np.concatenate([[0], np.cumsum(counts)])
+    offsets = np.concatenate([[0], np.cumsum(np.bincount(inverse, minlength=P))])
 
     for pid in range(P):
-        start, end = offsets[pid], offsets[pid+1]
-        pts = points[start:end][:max_points_per_pillar]
+        pts = points[offsets[pid]:offsets[pid+1]][:max_points_per_pillar]
         n = len(pts)
-        num_points_out[pid] = n
-        cz = pts[:, 2].mean()
-        pillar_out[pid, :n, 0:4] = pts[:, 0:4]
-        pillar_out[pid, :n, 4] = pts[:, 0] - cx[pid]
-        pillar_out[pid, :n, 5] = pts[:, 1] - cy[pid]
-        pillar_out[pid, :n, 6] = pts[:, 2] - cz
-        pillar_out[pid, :n, 7] = pts[:, 0] - global_mean_x
-        pillar_out[pid, :n, 8] = pts[:, 1] - global_mean_y
+        n_out[pid], cz = n, pts[:, 2].mean()
+        p_out[pid, :n, 0:4] = pts[:, 0:4]
+        p_out[pid, :n, 4], p_out[pid, :n, 5], p_out[pid, :n, 6] = pts[:,0]-cx[pid], pts[:,1]-cy[pid], pts[:,2]-cz
+        p_out[pid, :n, 7], p_out[pid, :n, 8] = pts[:,0]-gm_x, pts[:,1]-gm_y
 
-    return pillar_out, coords_out, num_points_out
+    return p_out, c_out, n_out
 
 # ── Dataset ───────────────────────────────────────────────────────
 class DAIRDataset(Dataset):
     def __init__(self, split: str = 'train'):
-        assert split in ('train', 'val', 'test')
-        self.split = split
-        with open(SPLIT_FILE) as f:
+        with open(p(SPLIT_FILE)) as f:
             all_ids = json.load(f)[split]
-        self.ids = [fid for fid in all_ids if os.path.exists(f'{PCD_DIR}/{fid}.pcd') and os.path.exists(f'{LABEL_DIR}/{fid}.json')]
+        self.split = split
+        self.ids = [fid for fid in all_ids if (PCD_DIR / f'{fid}.pcd').exists()]
         print(f'[DAIRDataset] {split}: {len(self.ids)} vzoriek')
-        
         if self.split == 'train':
-            self.gt_sampler = GTSampler(db_path='gt_database')
+            self.gt_sampler = GTSampler()
 
-    def __len__(self):
-        return len(self.ids)
+    def __len__(self): return len(self.ids)
 
     def __getitem__(self, idx):
         fid = self.ids[idx]
-        points = load_pcd(f'{PCD_DIR}/{fid}.pcd')
-        points = filter_pointcloud(points)
-        boxes = load_labels(f'{LABEL_DIR}/{fid}.json')
+        points = filter_pointcloud(load_pcd(p(PCD_DIR / f'{fid}.pcd')))
+        boxes = load_labels(p(LABEL_DIR / f'{fid}.json'))
+        gt_boxes = np.array([[b.x, b.y, b.z, b.length, b.width, b.height, b.rotation, b.class_id] for b in boxes if b.class_id >= 0], dtype=np.float32) if boxes else np.zeros((0, 8))
 
-        valid_boxes_list = [b for b in boxes if b.class_id >= 0]
-        if valid_boxes_list:
-            gt_boxes = np.array([[b.x, b.y, b.z, b.length, b.width, b.height, b.rotation, b.class_id] for b in valid_boxes_list], dtype=np.float32)
-        else:
-            gt_boxes = np.zeros((0, 8), dtype=np.float32)
-
-        # 👇 AUGMENTÁCIA (iba pre train)
         if self.split == 'train' and hasattr(self, 'gt_sampler'):
             s_pts, s_boxes = self.gt_sampler.sample(gt_boxes)
-            if len(s_pts) > 0:
-                points = np.vstack([points] + s_pts)
-                gt_boxes = np.vstack([gt_boxes, s_boxes])
+            if s_pts: points, gt_boxes = np.vstack([points] + s_pts), np.vstack([gt_boxes, s_boxes])
 
         pillars, coords, num_pts = create_pillars(points)
-
-        return {
-            'pillars':    torch.from_numpy(pillars),
-            'coords':     torch.from_numpy(coords),
-            'num_points': torch.from_numpy(num_pts),
-            'gt_boxes':   torch.from_numpy(gt_boxes),
-            'frame_id':   fid,
-            'raw_points': points
-        }
-
-class DAIRDatasetCached(Dataset):
-    def __init__(self, split: str = 'train', cache_dir: str = '/content/dair/cache'):
-        with open(SPLIT_FILE) as f:
-            all_ids = json.load(f)[split]
-        self.cache_dir = cache_dir
-        self.ids = [fid for fid in all_ids if os.path.exists(f'{cache_dir}/{fid}.npz')]
-
-    def __len__(self):
-        return len(self.ids)
-
-    def __getitem__(self, idx):
-        fid  = self.ids[idx]
-        data = np.load(f'{self.cache_dir}/{fid}.npz')
-        return {
-            'pillars':    torch.from_numpy(data['pillars']),
-            'coords':     torch.from_numpy(data['coords']),
-            'num_points': torch.from_numpy(data['num_points']),
-            'gt_boxes':   torch.from_numpy(data['gt_boxes']),
-            'frame_id':   fid,
-        }
+        return {'pillars': torch.from_numpy(pillars), 'coords': torch.from_numpy(coords), 'num_points': torch.from_numpy(num_pts), 'gt_boxes': torch.from_numpy(gt_boxes), 'frame_id': fid, 'raw_points': points}
 
 if __name__ == '__main__':
     ds = DAIRDataset(split='train')
-    sample = ds[0]
-    print(f"Frame ID: {sample['frame_id']} | Pillars: {sample['pillars'].shape} | GT: {sample['gt_boxes'].shape}")
+    if len(ds) > 0:
+        sample = ds[0]
+        print(f"Frame ID: {sample['frame_id']} | Pillars: {sample['pillars'].shape} | GT: {sample['gt_boxes'].shape}")
