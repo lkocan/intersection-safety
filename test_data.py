@@ -139,4 +139,16 @@ def main():
                 current_lines.append(line_set)
 
         # --- C. UPDATE OKNA ---
-        keep
+        keep_running = vis.poll_events()
+        vis.update_renderer()
+        
+        if not keep_running:
+            break
+            
+        import time
+        time.sleep(0.05) # Frekvencia prehrávania (20 FPS)
+
+    vis.destroy_window()
+
+if __name__ == "__main__":
+    main()
