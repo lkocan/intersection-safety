@@ -8,7 +8,7 @@ class PointPillarsLoss(nn.Module):
     def __init__(
         self,
         alpha=0.25,
-        gamma=2.0,
+        gamma=3.0,
         w_cls=1.0,
         w_reg=2.0,
         w_dir=0.2,
@@ -40,12 +40,20 @@ class PointPillarsLoss(nn.Module):
         pred_sig = torch.sigmoid(pred)
         bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         p_t = pred_sig * target + (1 - pred_sig) * (1 - target)
-        alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
-        loss = alpha_t * (1 - p_t).pow(self.gamma) * bce
-
-        loss = loss * valid_mask.float()
-        denom = valid_mask.float().sum().clamp(min=1.0)
-        return loss.sum() / denom
+        
+        focal_weight = (self.alpha * target + (1 - self.alpha) * (1 - target)) * torch.pow((1 - p_t), self.gamma)
+        
+        loss = focal_weight * bce
+        
+        class_weights = torch.tensor([1.0, 5.0, 5.0], device=loss.device)
+        
+        for c in range(self.num_classes):
+            class_channels = torch.arange(c, loss.shape[1], self.num_classes)
+            pos_mask = target[:, class_channels, :, :] == 1.0
+            
+            loss[:, class_channels, :, :][pos_mask] *= class_weights[c]
+        
+        return (loss * valid_mask).sum() / (valid_mask.sum() + 1e-6)
 
     def _build_targets(self, preds, gt_boxes):
         cls_pred = preds['cls']
