@@ -2,128 +2,101 @@ import os
 import sys
 import torch
 import numpy as np
-import cv2
+import open3d as o3d
 import json
 
 # 1. NASTAVENIE PROSTREDIA
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(PROJECT_ROOT)
 
-# Importy z tvojich modulov
 from utils.preprocess import DAIRDataset, DAIR_ROOT
 from models.pointpillars import PointPillars, PointPillarsConfig
 from tracking.tracker import Tracker3D
 from utils.roi_utils import calculate_risk_score
-from utils.incident_logger import IncidentLogger
 
 def get_device():
-    """Detekcia hardvéru (Priorita: MPS pre Mac M4)."""
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    elif torch.cuda.is_available():
-        return torch.device("cuda")
+    if torch.backends.mps.is_available(): return torch.device("mps")
     return torch.device("cpu")
+
+def get_box_lineset(t, color=(0, 1, 0)):
+    """Vytvorí 3D drôtený model (LineSet) pre bounding box z tracku."""
+    # Parametre z trackera
+    pos = t.kf.x[:3]  # x, y, z
+    dim = [t.l, t.w, t.h] # dĺžka, šírka, výška
+    yaw = t.yaw
+
+    # Vytvorenie orientovaného boxu v Open3D
+    center = np.array([pos[0], pos[1], pos[2]])
+    R = o3d.geometry.get_rotation_matrix_from_axis_angle([0, 0, yaw])
+    box = o3d.geometry.OrientedBoundingBox(center, R, dim)
+    
+    # Prevod na LineSet (čiary), aby sme mohli meniť farbu a hrúbku
+    lineset = o3d.geometry.LineSet.create_from_oriented_bounding_box(box)
+    lineset.paint_uniform_color(color)
+    return lineset
 
 def main():
     device = get_device()
     cfg = PointPillarsConfig()
-    
-    # 2. NAČÍTANIE MODELU
-    ckpt_path = os.path.join(PROJECT_ROOT, 'checkpoints', 'last.pth')
-    model = PointPillars(cfg).to(device)
-    
-    if os.path.exists(ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(checkpoint['state_dict'])
-        print(f"Model načítaný na: {device}")
-    else:
-        print(f"Pozor: Checkpoint nenájdený. Bežím s náhodnými váhami.")
+    dataset = DAIRDataset(split='val')
+    tracker = Tracker3D()
 
-    model.eval()
-
-    # 3. INICIALIZÁCIA KOMPONENTOV
-    # Načítanie ROI ak existuje
-    roi_path = os.path.join(PROJECT_ROOT, 'roi_config.json')
-    roi_coords = None
-    if os.path.exists(roi_path):
-        with open(roi_path, 'r') as f:
-            roi_coords = json.load(f).get('roi')
+    # 2. INICIALIZÁCIA OPEN3D VIZUALIZÉRA
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="M4 3D Safety Monitor", width=1280, height=720)
     
-    tracker = Tracker3D(roi_coords=roi_coords)
-    logger = IncidentLogger(log_dir=os.path.join(PROJECT_ROOT, 'logs/incidents'))
-
-    # 4. NAČÍTANIE DATASETU
-    try:
-        # Používame základný DAIRDataset (číta PCD priamo)
-        dataset = DAIRDataset(split='val')
-        print(f"Dataset pripravený ({len(dataset)} vzoriek).")
-    except Exception as e:
-        print(f"Chyba pri načítaní datasetu: {e}")
-        return
-
-    # 5. TESTOVACIA SLUČKA
-    print("--- Spúšťam vizualizáciu (Stlač 'q' pre ukončenie) ---")
+    # Príprava mračna bodov
+    pcd_o3d = o3d.geometry.PointCloud()
+    vis.add_geometry(pcd_o3d)
     
+    # Kontajner pre boxy (aby sme ich vedeli mazať každý snímok)
+    current_boxes = []
+
+    print("--- Spúšťam interaktívne 3D (Ovládanie: Myš + Shift) ---")
+
     for i in range(len(dataset)):
         data = dataset[i]
         
-        # Príprava dát pre MPS
-        pillars = data['pillars'].unsqueeze(0).to(device)
-        coords = data['coords'].unsqueeze(0).to(device)
-        n_pts = data['num_points'].unsqueeze(0).to(device)
+        # 3. AKTUALIZÁCIA BODov (Point Cloud)
+        # Predpokladáme, že dataset vracia body v 'points' (N, 3 alebo N, 4)
+        points = data['points'][:, :3].numpy()
+        pcd_o3d.points = o3d.utility.Vector3dVector(points)
+        
+        # Farbenie bodov podľa výšky (ako v Matlabe)
+        z_values = points[:, 2]
+        colors = np.zeros((len(z_values), 3))
+        colors[:, 2] = (z_values - z_values.min()) / (z_values.max() - z_values.min() + 1e-6)
+        pcd_o3d.colors = o3d.utility.Vector3dVector(colors)
+        
+        vis.update_geometry(pcd_o3d)
 
-        with torch.no_grad():
-            # Získanie Ground Truth boxov (N, 8)
-            gt = data['gt_boxes'].numpy() 
-            
-            # OPRAVA INDEXU: Tracker očakáva 9 hodnôt [x,y,z,w,l,h,yaw,class,score]
-            # DAIR GT má 8 hodnôt [x,y,z,w,l,h,yaw,class]
-            if gt.shape[0] > 0 and gt.shape[1] == 8:
-                # Pridáme stĺpec s istotou 1.0
-                scores = np.ones((gt.shape[0], 1), dtype=np.float32)
-                detections = np.hstack([gt, scores])
-            else:
-                detections = gt
-
-        # 6. TRACKING & RISK ANALYSIS
+        # 4. TRACKING
+        gt = data['gt_boxes'].numpy()
+        # Padding na 9 stĺpcov pre tracker
+        detections = np.hstack([gt, np.ones((gt.shape[0], 1))]) if gt.shape[0] > 0 else gt
         confirmed = tracker.update(detections)
-        logger.add_frame(confirmed)
+
+        # 5. AKTUALIZÁCIA 3D BOXOV
+        for b in current_boxes:
+            vis.remove_geometry(b, reset_bounding_box=False)
+        current_boxes.clear()
 
         for t in confirmed:
             risk = calculate_risk_score(t, confirmed)
             t.update_risk(risk)
-            # Automatické logovanie pri vysokom riziku
-            if t.smoothed_risk > 0.8:
-                logger.save_incident(t.id, t.smoothed_risk)
-
-        # 7. VIZUALIZÁCIA (Bird's Eye View)
-        bev = np.zeros((600, 600, 3), dtype=np.uint8)
-        
-        # Kreslenie pomocnej mriežky
-        cv2.line(bev, (300, 0), (300, 600), (40, 40, 40), 1)
-        cv2.line(bev, (0, 300), (600, 300), (40, 40, 40), 1)
-
-        for t in confirmed:
-            # Prepočet metrov na pixely (stred 300,300 | 1m = 5px)
-            px = int(300 - t.kf.x[1] * 5)
-            py = int(300 - t.kf.x[0] * 5)
             
-            # Farba podľa rizika (Zelená -> Červená)
-            risk_val = getattr(t, 'smoothed_risk', 0)
-            color = (0, int(255 * (1 - risk_val)), int(255 * risk_val))
+            # Farba od zelenej (0,1,0) po červenú (1,0,0)
+            color = (t.smoothed_risk, 1 - t.smoothed_risk, 0)
             
-            cv2.circle(bev, (px, py), 8, color, -1)
-            cv2.putText(bev, f"ID:{t.id} R:{risk_val:.2f}", (px + 10, py), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            box_lineset = get_box_lineset(t, color=color)
+            vis.add_geometry(box_lineset, reset_bounding_box=False)
+            current_boxes.append(box_lineset)
 
-        cv2.imshow("M4 Safety Monitor", bev)
-        
-        # Ukončenie klávesou 'q'
-        if cv2.waitKey(20) & 0xFF == ord('q'):
-            break
+        # 6. RENDER
+        if not vis.poll_events(): break
+        vis.update_renderer()
 
-    cv2.destroyAllWindows()
-    print("Test ukončený.")
+    vis.destroy_window()
 
 if __name__ == "__main__":
     main()
