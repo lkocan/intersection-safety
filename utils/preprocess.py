@@ -390,6 +390,7 @@ class DAIRDataset(Dataset):
             'num_points': torch.from_numpy(num_pts),    # (P,)
             'gt_boxes':   torch.from_numpy(gt_boxes),   # (M, 8)
             'frame_id':   fid,
+            'raw_points':    points
         }
         
 class DAIRDatasetCached(Dataset):
