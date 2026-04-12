@@ -26,7 +26,7 @@ class PointPillarsConfig:
     # Tréning
     learning_rate = 1e-3
     batch_size    = 4
-    num_epochs    = 50
+    num_epochs    = 100
 
 
 # ── PillarFeatureNet ──────────────────────────────────────────────
