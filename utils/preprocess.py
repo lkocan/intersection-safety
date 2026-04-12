@@ -10,8 +10,8 @@ from torch.utils.data import Dataset
 
 
 # ── Konfigurácia ciest ────────────────────────────────────────────
-DAIR_ROOT  = '/Users/lkocan/Documents/MATLAB/data/single-infrastructure-side'
-PCD_DIR    = f'{DAIR_ROOT}/single-infrastructure-side-velodyne'
+DAIR_ROOT  = '/Users/lkocan/Documents/intersection-safety-1/data'
+PCD_DIR    = f'{DAIR_ROOT}/pcd'
 LABEL_DIR  = f'{DAIR_ROOT}/label/virtuallidar'
 SPLIT_FILE = f'{DAIR_ROOT}/split_data.json'
 
