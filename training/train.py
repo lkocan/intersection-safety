@@ -1,18 +1,25 @@
 import sys
 import os
 
+# Pridanie koreňového adresára do cesty pre správne importy
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import torch
-from torch.utils.data    import DataLoader
-from torch.cuda.amp      import GradScaler, autocast   # ← FP16
+from torch.utils.data import DataLoader
+# Pozor: Na Macu (MPS) sa GradScaler v niektorých verziách torch správa inak, 
+# ale ponechávame ho pre kompatibilitu.
+from torch.cuda.amp import GradScaler, autocast 
 
 from models.pointpillars import PointPillars, PointPillarsConfig
-from training.loss       import PointPillarsLoss
-from utils.preprocess import DAIRDatasetCached as DAIRDataset
-
+from training.loss import PointPillarsLoss
+# Importujeme klasický DAIRDataset (nie Cached), aby fungoval GTSampler
+from utils.preprocess import DAIRDataset
 
 def collate_fn(batch):
+    """
+    Zlučuje vzorky do batchu. 
+    Vynechávame 'raw_points', pretože majú rôzne veľkosti a nepotrebujeme ich v GPU.
+    """
     return {
         'pillars': torch.stack([b['pillars'] for b in batch], dim=0).float(),
         'coords': torch.stack([b['coords'] for b in batch], dim=0).int(),
@@ -21,10 +28,10 @@ def collate_fn(batch):
         'frame_id': [b['frame_id'] for b in batch],
     }
 
-
-def train(cfg, device, save_dir='/content/checkpoints', start_epoch=0):
+def train(cfg, device, save_dir='./checkpoints_v2', start_epoch=0):
     os.makedirs(save_dir, exist_ok=True)
 
+    # Inicializujeme dataset (GTSampler sa zapne automaticky vnútri pre split='train')
     train_ds = DAIRDataset(split='train')
     val_ds   = DAIRDataset(split='val')
 
@@ -32,44 +39,53 @@ def train(cfg, device, save_dir='/content/checkpoints', start_epoch=0):
         train_ds,
         batch_size       = cfg.batch_size,
         shuffle          = True,
-        num_workers      = 4,              # ← zvýšené
+        num_workers      = 4,                 # Prispôsob podľa počtu jadier na Macu
         collate_fn       = collate_fn,
-        pin_memory       = True,
-        persistent_workers = True,         # ← workers ostanú nažive
-        prefetch_factor  = 2,              # ← načítaj dopredu
+        pin_memory       = (device.type == 'cuda'), # Iba pre NVIDIA GPU
+        persistent_workers = True,
+        prefetch_factor  = 2,
     )
+    
     val_loader = DataLoader(
         val_ds,
         batch_size       = cfg.batch_size,
         shuffle          = False,
         num_workers      = 4,
         collate_fn       = collate_fn,
-        pin_memory       = True,
-        persistent_workers = True,
     )
 
     model     = PointPillars(cfg).to(device)
+    # Loss funkcia už obsahuje tvoje nové váhy pre chodcov/cyklistov
     criterion = PointPillarsLoss().to(device)
+    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr           = cfg.learning_rate,
         weight_decay = 0.01,
     )
+    
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr          = cfg.learning_rate,
         steps_per_epoch = len(train_loader),
         epochs          = cfg.num_epochs,
     )
-    scaler = GradScaler()                  # ← FP16 scaler
+    
+    # scaler na Macu (MPS) niekedy nie je podporovaný, ošetríme to nižšie
+    use_amp = (device.type == 'cuda')
+    scaler = GradScaler(enabled=use_amp)
 
+    print("-" * 30)
+    print(f"🚀 ŠTART TRÉNINGU")
+    print(f"Zariadenie: {device}")
+    print(f"Počet epoch: {cfg.num_epochs}")
+    print(f"Batch size: {cfg.batch_size}")
     print(f"Model parametrov: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Tréning: {len(train_ds)} | Val: {len(val_ds)} | Device: {device}\n")
+    print("-" * 30)
 
     best_val_loss = float('inf')
 
     for epoch in range(start_epoch, cfg.num_epochs):
-        # ── Tréning ───────────────────────────────────────────────
         model.train()
         train_losses = []
 
@@ -77,30 +93,37 @@ def train(cfg, device, save_dir='/content/checkpoints', start_epoch=0):
             pillars    = batch['pillars'].to(device,    non_blocking=True)
             coords     = batch['coords'].to(device,     non_blocking=True)
             num_points = batch['num_points'].to(device, non_blocking=True)
-            gt_boxes   = batch['gt_boxes']
+            gt_boxes   = [boxes.to(device) for boxes in batch['gt_boxes']]
             B          = pillars.shape[0]
 
             optimizer.zero_grad()
 
-            with autocast():               # ← FP16 forward pass
+            # Na Macu (MPS) autocast zatiaľ nie je plne stabilný, používame len ak máme CUDA
+            if use_amp:
+                with autocast():
+                    preds  = model(pillars, coords, num_points, batch_size=B)
+                    losses = criterion(preds, gt_boxes, batch_size=B)
+                scaler.scale(losses['total']).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Štandardný pass pre Mac (MPS) / CPU
                 preds  = model(pillars, coords, num_points, batch_size=B)
                 losses = criterion(preds, gt_boxes, batch_size=B)
+                losses['total'].backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+                optimizer.step()
 
-            scaler.scale(losses['total']).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-            scaler.step(optimizer)
-            scaler.update()
             scheduler.step()
-
             train_losses.append(losses['total'].item())
 
-            if i % 50 == 0:
-                print(f"Epoch {epoch+1}/{cfg.num_epochs} "
-                      f"[{i}/{len(train_loader)}]  "
-                      f"loss={losses['total'].item():.4f}  "
-                      f"cls={losses['cls'].item():.4f}  "
-                      f"reg={losses['reg'].item():.4f}")
+            if i % 20 == 0:
+                print(f"E{epoch+1} [{i}/{len(train_loader)}] "
+                      f"Loss: {losses['total'].item():.4f} | "
+                      f"Cls: {losses['cls'].item():.4f} | "
+                      f"Reg: {losses['reg'].item():.4f}")
 
         avg_train = sum(train_losses) / len(train_losses)
 
@@ -110,20 +133,20 @@ def train(cfg, device, save_dir='/content/checkpoints', start_epoch=0):
 
         with torch.no_grad():
             for batch in val_loader:
-                pillars    = batch['pillars'].to(device,    non_blocking=True)
-                coords     = batch['coords'].to(device,     non_blocking=True)
-                num_points = batch['num_points'].to(device, non_blocking=True)
+                pillars    = batch['pillars'].to(device)
+                coords     = batch['coords'].to(device)
+                num_points = batch['num_points'].to(device)
+                gt_boxes   = [boxes.to(device) for boxes in batch['gt_boxes']]
                 B          = pillars.shape[0]
 
-                with autocast():
-                    preds  = model(pillars, coords, num_points, batch_size=B)
-                    losses = criterion(preds, batch['gt_boxes'], batch_size=B)
-
+                preds  = model(pillars, coords, num_points, batch_size=B)
+                losses = criterion(preds, gt_boxes, batch_size=B)
                 val_losses.append(losses['total'].item())
 
         avg_val = sum(val_losses) / len(val_losses)
-        print(f"\n→ Epoch {epoch+1} | train={avg_train:.4f} | val={avg_val:.4f}\n")
+        print(f"\n✅ Epoch {epoch+1} FINISHED | Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
 
+        # Ukladanie
         checkpoint = {
             'epoch':      epoch + 1,
             'state_dict': model.state_dict(),
@@ -135,10 +158,16 @@ def train(cfg, device, save_dir='/content/checkpoints', start_epoch=0):
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             torch.save(checkpoint, f'{save_dir}/best.pth')
-            print(f"✓ Najlepší model uložený (val_loss={avg_val:.4f})")
-
+            print(f"⭐ NOVÝ NAJLEPŠÍ MODEL ULOŽENÝ (Val Loss: {avg_val:.4f})\n")
 
 if __name__ == '__main__':
     cfg    = PointPillarsConfig()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Detekcia Apple Silicon (MPS) alebo CUDA
+    if torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+        
     train(cfg, device)
