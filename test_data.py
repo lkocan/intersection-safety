@@ -1,109 +1,82 @@
 import os
-import sys
 import torch
 import numpy as np
 import open3d as o3d
-import json
-
-# 1. NASTAVENIE PROSTREDIA
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(PROJECT_ROOT)
-
+import matplotlib.pyplot as plt
 from utils.preprocess import DAIRDataset
-from tracking.tracker import Tracker3D
-from utils.roi_utils import calculate_risk_score
-
-def load_roi(path):
-    """Načíta ROI súradnice a vytvorí 3D LineSet pre vizualizáciu."""
-    if not os.path.exists(path):
-        return None
-    with open(path, 'r') as f:
-        roi_data = json.load(f).get('roi', [])
-    
-    if not roi_data:
-        return None
-
-    # Vytvorenie bodov pre LineSet (Z = -1.5m pre úroveň cesty)
-    points = [[p[0], p[1], -1.5] for p in roi_data]
-    points.append(points[0]) # Uzavretie polygónu
-    
-    lines = [[i, i+1] for i in range(len(points)-1)]
-    
-    roi_lineset = o3d.geometry.LineSet()
-    roi_lineset.points = o3d.utility.Vector3dVector(points)
-    roi_lineset.lines = o3d.utility.Vector2iVector(lines)
-    roi_lineset.paint_uniform_color([0.2, 0.2, 1.0]) # Modrá farba pre ROI
-    
-    return roi_lineset
-
-def get_box_lineset(t, color=(0, 1, 0)):
-    """Vytvorí 3D box pre detekciu."""
-    pos = t.kf.x[:3]
-    dim = [t.l, t.w, t.h]
-    yaw = t.yaw
-    R = o3d.geometry.get_rotation_matrix_from_axis_angle([0, 0, yaw])
-    box = o3d.geometry.OrientedBoundingBox(pos, R, dim)
-    ls = o3d.geometry.LineSet.create_from_oriented_bounding_box(box)
-    ls.paint_uniform_color(color)
-    return ls
+# Ak používaš tracker, odkomentuj riadok nižšie:
+# from tracking.tracker import Tracker3D
 
 def main():
+    # 1. Inicializácia datasetu (uisti sa, že cesty v configu sú správne)
     dataset = DAIRDataset(split='val')
-    
-    # Načítanie ROI konfigurácie
-    roi_path = os.path.join(PROJECT_ROOT, 'roi_config.json')
-    roi_visual = load_roi(roi_path)
-    
-    tracker = Tracker3D(roi_coords=None) # ROI riešime vizuálne
+    print(f"[DAIRDataset] Načítaných {len(dataset)} vzoriek")
 
-    # 2. OPEN3D SETUP
+    # 2. Nastavenie Open3D vizualizácie
     vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="M4 3D Safety Monitor - ROI Mode", width=1280, height=720)
+    vis.create_window(window_name="M4 PointPillars Monitor", width=1280, height=720)
     
     pcd_o3d = o3d.geometry.PointCloud()
     vis.add_geometry(pcd_o3d)
     
-    # Pridanie statickej ROI do scény
-    if roi_visual:
-        vis.add_geometry(roi_visual)
-    
-    current_boxes = []
+    # Pridanie súradnicového kríža pre lepšiu orientáciu (X-červená, Y-zelená, Z-modrá)
+    axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0)
+    vis.add_geometry(axes)
+
+    # Nastavenie pohľadu (voliteľné)
+    view_ctl = vis.get_view_control()
+    view_ctl.set_front([ -0.9, 0.1, 0.4 ])
+    view_ctl.set_lookat([ 0, 0, 0 ])
+    view_ctl.set_up([ 0, 0, 1 ])
+    view_ctl.set_zoom(0.3)
+
+    print("Spúšťam vizualizáciu... (stlač 'Q' v okne pre ukončenie)")
 
     for i in range(len(dataset)):
         data = dataset[i]
         
-        # 3. POINT CLOUD
-        points = data['points'][:, :3].numpy()
-        pcd_o3d.points = o3d.utility.Vector3dVector(points)
+        # --- REKONŠTRUKCIA BODOV Z PILLAROV ---
+        # Pillars tvar: [12000, 32, 9] -> berieme prvé 3 kanály (X, Y, Z)
+        pillars = data['pillars']
+        num_points = data['num_points']
         
-        # Dynamické farbenie podľa intenzity alebo výšky
-        z_norm = (points[:, 2] - points[:, 2].min()) / (points[:, 2].max() - points[:, 2].min() + 1e-6)
-        colors = np.zeros_like(points)
-        colors[:, 1] = z_norm  # Zelený kanál podľa výšky
-        pcd_o3d.colors = o3d.utility.Vector3dVector(colors)
+        # Sploštenie na [N, 3]
+        all_xyz = pillars[:, :, :3].reshape(-1, 3)
         
-        vis.update_geometry(pcd_o3d)
+        # Vytvorenie masky pre reálne body (num_points hovorí, koľko bodov v pillari nie je nula)
+        # Vytvoríme 2D masku [12000, 32] a sploštíme ju
+        p_mask = torch.zeros(pillars.shape[0], pillars.shape[1], dtype=torch.bool)
+        for p_idx in range(pillars.shape[0]):
+            p_mask[p_idx, :num_points[p_idx]] = True
+        p_mask = p_mask.reshape(-1)
 
-        # 4. TRACKING
-        gt = data['gt_boxes'].numpy()
-        detections = np.hstack([gt, np.ones((gt.shape[0], 1))]) if gt.shape[0] > 0 else gt
-        confirmed = tracker.update(detections)
+        # Finálne body pre Open3D
+        points_np = all_xyz[p_mask].cpu().numpy()
 
-        # 5. BOXES
-        for b in current_boxes: vis.remove_geometry(b, reset_bounding_box=False)
-        current_boxes.clear()
-
-        for t in confirmed:
-            risk = calculate_risk_score(t, confirmed)
-            t.update_risk(risk)
-            color = (t.smoothed_risk, 1 - t.smoothed_risk, 0)
+        if len(points_np) > 0:
+            # --- FARBENIE PODĽA PILLAROV ---
+            # Každý pillar dostane farbu z mapy 'tab20' (20 kontrastných farieb)
+            p_indices = torch.arange(pillars.shape[0]).repeat_interleave(pillars.shape[1])
+            active_p_indices = p_indices[p_mask].cpu().numpy()
             
-            box_ls = get_box_lineset(t, color=color)
-            vis.add_geometry(box_ls, reset_bounding_box=False)
-            current_boxes.append(box_ls)
+            cmap = plt.get_cmap('tab20')
+            normalized_indices = (active_p_indices % 20) / 20.0
+            colors_np = cmap(normalized_indices)[:, :3]
 
-        if not vis.poll_events(): break
+            # Aktualizácia dát v Open3D
+            pcd_o3d.points = o3d.utility.Vector3dVector(points_np)
+            pcd_o3d.colors = o3d.utility.Vector3dVector(colors_np)
+            
+            # Informovanie vizualizátora o zmene geometrie
+            vis.update_geometry(pcd_o3d)
+        
+        # Vykreslenie snímky
+        vis.poll_events()
         vis.update_renderer()
+        
+        # Malá pauza, aby si stíhal vnímať pohyb (cca 20 FPS)
+        import time
+        time.sleep(0.05)
 
     vis.destroy_window()
 
