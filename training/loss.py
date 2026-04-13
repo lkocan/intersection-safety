@@ -33,7 +33,7 @@ class PointPillarsLoss(nn.Module):
 
         self.num_classes = 3
         self.reg_box_dim = 7
-        self.anchor_id = 0 # Predpokladáme zatiaľ jeden anchor set
+        self.anchor_id = 0 
 
     def focal_loss_masked(self, pred, target, valid_mask):
         pred_sig = torch.sigmoid(pred)
@@ -44,15 +44,12 @@ class PointPillarsLoss(nn.Module):
         
         loss = focal_weight * bce
         
-        # Váhy pre triedy (Car=1.0, Pedestrian=5.0, Cyclist=5.0)
         class_weights = torch.tensor([1.0, 5.0, 5.0], device=loss.device)
         
         for c in range(self.num_classes):
-            # Vyberieme kanály patriace konkrétnej triede naprieč všetkými anchormi
             class_channels = torch.arange(c, loss.shape[1], self.num_classes)
             pos_mask = target[:, class_channels, :, :] == 1.0
             
-            # Použijeme indexovanie pre aplikáciu váhy na pozitívne vzorky
             if pos_mask.any():
                 loss_view = loss[:, class_channels, :, :]
                 loss_view[pos_mask] *= class_weights[c]
@@ -60,7 +57,6 @@ class PointPillarsLoss(nn.Module):
         return (loss * valid_mask).sum() / (valid_mask.sum() + 1e-6)
 
     def _build_targets(self, preds, gt_boxes):
-        # OPRAVENÉ KĽÚČE: zladené s pointpillars.py
         cls_pred = preds['cls_preds']
         reg_pred = preds['reg_preds']
         dir_pred = preds['dir_preds']
@@ -83,7 +79,6 @@ class PointPillarsLoss(nn.Module):
         sx = vx * self.backbone_stride
         sy = vy * self.backbone_stride
 
-        # Základné offsety pre kanály
         reg_ch0 = self.anchor_id * self.reg_box_dim
         dir_ch0 = self.anchor_id * 2
 
@@ -92,7 +87,7 @@ class PointPillarsLoss(nn.Module):
                 continue
 
             boxes = gt_boxes[b].to(device)
-            # Teraz spracovávame všetky triedy (cls_id 0, 1, 2)
+            
             for box in boxes:
                 x, y, z, l, w, h, rot, cls_id = box.tolist()
                 cls_id = int(cls_id)
@@ -106,14 +101,12 @@ class PointPillarsLoss(nn.Module):
                 if gx < 0 or gx >= W or gy < 0 or gy >= H:
                     continue
 
-                # Výpočet správneho kanálu pre triedu
                 cls_ch = self.anchor_id * self.num_classes + cls_id
                 cls_target[b, cls_ch, gy, gx] = 1.0
 
                 cell_cx = x_min + (gx + 0.5) * sx
                 cell_cy = y_min + (gy + 0.5) * sy
 
-                # Regresné cieľové hodnoty
                 reg_target[b, reg_ch0 + 0, gy, gx] = (x - cell_cx) / sx
                 reg_target[b, reg_ch0 + 1, gy, gx] = (y - cell_cy) / sy
                 reg_target[b, reg_ch0 + 2, gy, gx] = z
@@ -122,14 +115,12 @@ class PointPillarsLoss(nn.Module):
                 reg_target[b, reg_ch0 + 5, gy, gx] = math.log(max(h, 1e-3))
                 reg_target[b, reg_ch0 + 6, gy, gx] = math.sin(rot)
 
-                # Smerové cieľové hodnoty
                 dir_bin = 0 if math.cos(rot) >= 0 else 1
                 dir_target[b, dir_ch0 + dir_bin, gy, gx] = 1.0
 
                 reg_mask[b, gy, gx] = True
                 dir_mask[b, gy, gx] = True
 
-                # Ignore radius pre klasifikáciu
                 r = self.ignore_radius
                 y0, y1 = max(0, gy - r), min(H, gy + r + 1)
                 x0, x1 = max(0, gx - r), min(W, gx + r + 1)
@@ -140,7 +131,6 @@ class PointPillarsLoss(nn.Module):
         return cls_target, reg_target, dir_target, cls_valid_mask, reg_mask, dir_mask
 
     def forward(self, preds, gt_boxes, batch_size):
-        # OPRAVENÉ KĽÚČE: zladené s pointpillars.py
         cls_pred = preds['cls_preds']
         reg_pred = preds['reg_preds']
         dir_pred = preds['dir_preds']
@@ -149,12 +139,10 @@ class PointPillarsLoss(nn.Module):
             preds, gt_boxes
         )
 
-        # 1. Klasifikačná strata
         cls_loss = self.focal_loss_masked(cls_pred, cls_target, cls_valid_mask)
 
-        # 2. Regresná strata (Smooth L1)
         reg_ch0 = self.anchor_id * self.reg_box_dim
-        # Tu berieme podskupinu kanálov pre daný anchor (v tvojom prípade prvých 7)
+
         reg_pred_act = reg_pred[:, reg_ch0:reg_ch0 + 7, :, :]
         reg_target_act = reg_target[:, reg_ch0:reg_ch0 + 7, :, :]
 
@@ -167,8 +155,7 @@ class PointPillarsLoss(nn.Module):
             )
         else:
             reg_loss = reg_pred.sum() * 0.0
-
-        # 3. Smerová strata (BCE)
+            
         dir_ch0 = self.anchor_id * 2
         dir_pred_act = dir_pred[:, dir_ch0:dir_ch0 + 2, :, :]
         dir_target_act = dir_target[:, dir_ch0:dir_ch0 + 2, :, :]
