@@ -6,7 +6,6 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 
 # --- UNIVERZÁLNE NASTAVENIE CIEST ---
-# Zistí root projektu bez ohľadu na to, kde skript beží
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
 
@@ -30,10 +29,10 @@ def train():
     # --- AUTOMATICKÁ DETEKCIA HARDVÉRU ---
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        use_amp = True  # Nvidia GPU - zapíname zmiešanú presnosť
+        use_amp = True
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
-        use_amp = False # Apple Silicon - stabilnejšie v FP32
+        use_amp = False
     else:
         device = torch.device("cpu")
         use_amp = False
@@ -45,9 +44,8 @@ def train():
     print("="*40 + "\n")
 
     # --- DATA LOADERY ---
-    # num_workers: 8 pre M4 (10 jadier), v Colabe (T4) dajte radšej 4
     n_workers = 8 if device.type != 'cpu' else 0
-    if os.environ.get('COLAB_GPU'): n_workers = 4 # Optimalizácia pre Colab
+    if os.environ.get('COLAB_GPU'): n_workers = 4
 
     train_ds = DAIRDataset(split='train')
     val_ds   = DAIRDataset(split='val')
@@ -75,10 +73,8 @@ def train():
         steps_per_epoch=len(train_loader), epochs=cfg.num_epochs
     )
 
-    # Používame modernejší API pre AMP
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
-    # Ukladanie do rootu projektu
     save_dir = BASE_DIR / 'checkpoints_universal'
     save_dir.mkdir(exist_ok=True)
 
@@ -98,7 +94,7 @@ def train():
 
             optimizer.zero_grad()
             
-            # Autocast pre Nvidiu, na Macu/CPU neaktívny
+            # Autocast pre Nvidiu
             with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', enabled=use_amp):
                 preds = model(pillars, coords, num_points, batch_size=pillars.shape[0])
                 losses = criterion(preds, gt_boxes, batch_size=pillars.shape[0])
@@ -138,7 +134,7 @@ def train():
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(checkpoint, save_dir / 'best.pth')
-            print(f"⭐ NOVÝ NAJLEPŠÍ MODEL (Loss: {avg_val_loss:.4f})")
+            print(f"NAJLEPŠÍ MODEL (Loss: {avg_val_loss:.4f})")
 
 if __name__ == '__main__':
     train()
