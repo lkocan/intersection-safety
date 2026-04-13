@@ -86,37 +86,30 @@ class Tracker3D:
         self._next_id = 1
 
     def update(self, detections: np.ndarray):
-        # 1. ROI Filtrovanie detekcií
         if self.roi_coords is not None:
             detections = filter_detections_by_roi(detections, self.roi_coords)
 
-        # 2. Predikcia Kalmanovho filtra
         predicted_states = [t.predict() for t in self.tracks]
 
-        # 3. Asociácia (Class-aware Hungarian)
         matched, unmatched_dets, unmatched_trks = self._associate(detections, predicted_states)
 
-        # 4. Aktualizácia spárovaných trackov
         for d_idx, t_idx in matched:
             self.tracks[t_idx].update(detections[d_idx][:7])
             if self.tracks[t_idx].state == TrackState.TENTATIVE and self.tracks[t_idx].hits >= self.min_hits:
                 self.tracks[t_idx].state = TrackState.CONFIRMED
 
-        # 5. Vytvorenie nových trackov
         for d_idx in unmatched_dets:
             d = detections[d_idx]
             new_track = Track(d[:7], d[7], d[8], self._next_id)
             self.tracks.append(new_track)
             self._next_id += 1
 
-        # 6. Správa životného cyklu
         for t_idx in unmatched_trks:
             if self.tracks[t_idx].time_since_update > self.max_age:
                 self.tracks[t_idx].state = TrackState.DELETED
 
         self.tracks = [t for t in self.tracks if t.state != TrackState.DELETED]
         
-        # Vráti len potvrdené objekty pre vizualizáciu/logovanie
         return [t for t in self.tracks if t.state == TrackState.CONFIRMED]
 
     def _associate(self, detections, predicted):
