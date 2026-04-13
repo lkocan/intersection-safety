@@ -45,9 +45,9 @@ def main():
         roi_line_set.lines = o3d.utility.Vector2iVector(lines)
         roi_line_set.colors = o3d.utility.Vector3dVector(colors)
         vis.add_geometry(roi_line_set)
-        print("✅ Modrá ROI zóna úspešne načítaná.")
+        print("Modrá ROI zóna úspešne načítaná.")
     except Exception as e:
-        print(f"⚠️ Upozornenie: Nepodarilo sa načítať modrú ROI zónu z roi_config.json ({e})")
+        print(f"Upozornenie: Nepodarilo sa načítať modrú ROI zónu z roi_config.json ({e})")
 
     print("\nSpúšťam vizualizáciu... (v okne stlač 'Q' pre koniec, 'R' pre reset pohľadu)")
 
