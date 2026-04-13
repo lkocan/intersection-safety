@@ -39,7 +39,7 @@ def train():
         use_amp = False
 
     print(f"\n" + "="*40)
-    print(f"🚀 ŠTART UNIVERZÁLNEHO TRÉNINGU")
+    print(f"ŠTART TRÉNINGU")
     print(f"Zariadenie: {device} | AMP: {use_amp}")
     print(f"Batch Size: {cfg.batch_size} | Epochy: {cfg.num_epochs}")
     print("="*40 + "\n")
