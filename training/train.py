@@ -5,7 +5,6 @@ import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-# --- UNIVERZÁLNE NASTAVENIE CIEST ---
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR))
 
@@ -14,7 +13,6 @@ from training.loss import PointPillarsLoss
 from utils.preprocess import DAIRDataset
 
 def collate_fn(batch):
-    """Zlučuje vzorky do batchu, filtruje raw_points pre úsporu RAM."""
     return {
         'pillars': torch.stack([b['pillars'] for b in batch], dim=0).float(),
         'coords': torch.stack([b['coords'] for b in batch], dim=0).int(),
@@ -26,7 +24,6 @@ def collate_fn(batch):
 def train():
     cfg = PointPillarsConfig()
     
-    # --- AUTOMATICKÁ DETEKCIA HARDVÉRU ---
     if torch.cuda.is_available():
         device = torch.device("cuda")
         use_amp = True
@@ -38,12 +35,11 @@ def train():
         use_amp = False
 
     print(f"\n" + "="*40)
-    print(f"ŠTART TRÉNINGU")
-    print(f"Zariadenie: {device} | AMP: {use_amp}")
-    print(f"Batch Size: {cfg.batch_size} | Epochy: {cfg.num_epochs}")
+    print(f"START OF TRAINING")
+    print(f"Device: {device} | AMP: {use_amp}")
+    print(f"Batch Size: {cfg.batch_size} | Epochs: {cfg.num_epochs}")
     print("="*40 + "\n")
 
-    # --- DATA LOADERY ---
     n_workers = 8 if device.type != 'cpu' else 0
     if os.environ.get('COLAB_GPU'): n_workers = 4
 
@@ -62,7 +58,6 @@ def train():
         num_workers=n_workers, collate_fn=collate_fn
     )
 
-    # --- MODEL & STRATA ---
     model = PointPillars(cfg).to(device)
     criterion = PointPillarsLoss().to(device)
     
@@ -80,7 +75,6 @@ def train():
 
     best_val_loss = float('inf')
 
-    # --- TRÉNINGOVÝ CYKLUS ---
     for epoch in range(cfg.num_epochs):
         model.train()
         epoch_losses = []
@@ -94,7 +88,6 @@ def train():
 
             optimizer.zero_grad()
             
-            # Autocast pre Nvidiu
             with torch.amp.autocast(device_type=device.type if device.type != 'mps' else 'cpu', enabled=use_amp):
                 preds = model(pillars, coords, num_points, batch_size=pillars.shape[0])
                 losses = criterion(preds, gt_boxes, batch_size=pillars.shape[0])
@@ -114,7 +107,6 @@ def train():
 
         avg_train_loss = sum(epoch_losses) / len(epoch_losses)
         
-        # --- VALIDÁCIA ---
         model.eval()
         val_losses = []
         with torch.no_grad():
@@ -126,15 +118,14 @@ def train():
                 val_losses.append(v_losses['total'].item())
 
         avg_val_loss = sum(val_losses) / len(val_losses)
-        print(f"\n🏁 Epoch {epoch+1} | Time: {time.time()-start_t:.1f}s | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+        print(f"\nEpoch {epoch+1} | Time: {time.time()-start_t:.1f}s | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
-        # --- UKLADANIE ---
         checkpoint = {'epoch': epoch+1, 'state_dict': model.state_dict(), 'val_loss': avg_val_loss}
         torch.save(checkpoint, save_dir / 'last.pth')
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(checkpoint, save_dir / 'best.pth')
-            print(f"NAJLEPŠÍ MODEL (Loss: {avg_val_loss:.4f})")
+            print(f"BEST MODEL (Loss: {avg_val_loss:.4f})")
 
 if __name__ == '__main__':
     train()
