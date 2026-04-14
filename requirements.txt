@@ -1,17 +1,15 @@
-# --- Core Deep Learning & GPU Acceleration ---
+#Deep Learning
 torch>=2.0.0
 torchvision
 numpy>=1.23.0
 
-# --- 3D Vizualizácia (Nahrádza CV2) ---
+#Visualization
 open3d>=0.16.0
+opencv-python-headless  
+scipy                   
+filterpy              
 
-# --- Spracovanie obrazu a pomocné nástroje ---
-opencv-python-headless  # Headless verzia stačí, keďže na 3D máš Open3D
-scipy                   # Potrebné pre Kalman Filter v trackeri
-filterpy                # Štandardná knižnica pre tracking algoritmy
-
-# --- Dataset a I/O ---
-nuscenes-devkit         # Často potrebné pre formáty 3D datasetov (ako DAIR-V2X)
-pyyaml                  # Načítanie konfiguračných súborov
-tqdm                    # Progress bary pre cykly v datasetoch
+#Dataset
+nuscenes-devkit         
+pyyaml                  
+tqdm                    
